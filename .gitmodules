@@ -1,0 +1,3 @@
+[submodule "Docker_plugin/NukeSamurai"]
+	path = Docker_plugin/NukeSamurai
+	url = https://github.com/Theo-SAMINADIN-td/NukeSamurai
