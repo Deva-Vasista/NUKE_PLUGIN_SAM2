@@ -1,8 +1,9 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
-import cv2
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 import numpy as np
 import OpenEXR
 import Imath
+import array
 from src.models.sam_wrapper import SAMProcessor
 from src.schemas.models import EXRResponse, ProcessSequenceRequest
 import tempfile
@@ -11,212 +12,229 @@ import torch
 from pathlib import Path
 from loguru import logger
 from src.utils.sequence_handler import EXRSequenceHandler
+from src.utils.progress_tracker import ProgressTracker
+import uuid
+import asyncio
+import cv2
 
 router = APIRouter()
 processor = SAMProcessor()
+progress_tracker = ProgressTracker()
 
-def read_exr(file_content: bytes) -> str:
-    """Read EXR file content and save as temporary file, return path"""
-    # Create a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.exr') as tmp:
-        tmp.write(file_content)
-        return tmp.name
-
-def write_exr(mask: np.ndarray) -> bytes:
-    """Convert numpy mask to EXR bytes"""
-    # Create a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.exr') as tmp:
-        tmp_path = tmp.name
+def read_exr_to_numpy(file_path: str) -> np.ndarray:
+    """Read EXR file and convert to numpy array."""
+    exr_file = OpenEXR.InputFile(file_path)
     
+    # Get data window
+    dw = exr_file.header()['dataWindow']
+    width = dw.max.x - dw.min.x + 1
+    height = dw.max.y - dw.min.y + 1
+
+    # Read all channels
+    FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
+    channels = ['R', 'G', 'B']
+    channel_data = []
+    
+    for channel in channels:
+        data = array.array('f', exr_file.channel(channel, FLOAT)).tolist()
+        channel_data.append(np.array(data).reshape(height, width))
+    
+    # Stack channels
+    img = np.dstack(channel_data)
+    return img
+
+def write_exr(mask: np.ndarray, output_path: str):
+    """Write numpy array to EXR file."""
+    height, width = mask.shape[-2:]
+    
+    header = OpenEXR.Header(width, height)
+    header['channels'] = {
+        'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+        'G': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+        'B': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+    }
+    
+    out = OpenEXR.OutputFile(output_path, header)
+    mask_float = mask.astype(np.float32)
+    
+    out.writePixels({
+        'R': mask_float.tobytes(),
+        'G': mask_float.tobytes(),
+        'B': mask_float.tobytes()
+    })
+    out.close()
+
+def parse_bbox(bbox_str: str) -> np.ndarray:
+    """Parse bbox string into numpy array."""
     try:
-        # Create header
-        header = OpenEXR.Header(mask.shape[1], mask.shape[0])
-        header['channels'] = {
-            'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
-            'G': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
-            'B': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
-        }
-        
-        # Create output file
-        out = OpenEXR.OutputFile(tmp_path, header)
-        
-        # Convert mask to float and write
-        mask_float = mask.astype(np.float32)
-        out.writePixels({
-            'R': mask_float.tobytes(),
-            'G': mask_float.tobytes(),
-            'B': mask_float.tobytes()
-        })
-        out.close()
-        
-        # Read the file back as bytes
-        with open(tmp_path, 'rb') as f:
-            return f.read()
-    finally:
-        # Clean up the temporary file
-        os.unlink(tmp_path)
-
-@router.post("/process_sequence")
-async def process_sequence(request: ProcessSequenceRequest):
-    try:
-        logger.info(f"Received sequence path: {request.sequence_path}")
-        logger.info(f"Sequence path type: {type(request.sequence_path)}")
-        logger.info(f"Sequence path contains %04d: {'%04d' in request.sequence_path}")
-        logger.info(f"Sequence path contains %03d: {'%03d' in request.sequence_path}")
-
-        # Validate sequence path
-        if not request.sequence_path:
-            logger.error("Sequence path is required")
-            raise HTTPException(status_code=400, detail="Sequence path is required")
-
-        if not os.path.exists(os.path.dirname(request.sequence_path)):
-            logger.error("Sequence directory does not exist")
-            raise HTTPException(status_code=400, detail="Sequence directory does not exist")
-
-        # Check for sequence pattern
-        has_pattern = "%04d" in request.sequence_path or "%03d" in request.sequence_path
-        logger.info(f"Sequence path has pattern: {has_pattern}")
-
-        if not has_pattern:
-            logger.error("Sequence path must contain %04d or %03d pattern")
-            raise HTTPException(status_code=400, detail="Sequence path must contain %04d or %03d pattern")
-
-        # Validate all frames exist
-        sequence_handler = EXRSequenceHandler(
-            sequence_path=request.sequence_path,
-            frame_range=request.frame_range,
-            original_fps=request.original_fps,
-            target_fps=request.target_fps,
-            bits=request.bits
-        )
-        missing_frames = [f for f in sequence_handler.frame_paths if not os.path.exists(f)]
-        if missing_frames:
-            logger.error(f"Missing frames: {missing_frames}")
-            raise HTTPException(status_code=400, detail=f"Missing frames: {missing_frames}")
-
-        # Call model on the whole sequence
-        try:
-            mask = processor.generate_mask(
-                request.sequence_path,
-                [float(x) for x in request.bbox.split(",")] if request.bbox else None,
-                frame_range=request.frame_range,
-                original_fps=request.original_fps,
-                target_fps=request.target_fps,
-                bits=request.bits
-            )
-        except Exception as e:
-            logger.error(f"SAM processing failed for sequence: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"SAM processing failed for sequence: {str(e)}")
-
-        # Save the first mask as EXR and return
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.exr') as tmp:
-            tmp_path = tmp.name
-        try:
-            header = OpenEXR.Header(mask.shape[1], mask.shape[0])
-            FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
-            mask_float = mask.astype(np.float32)
-            out = OpenEXR.OutputFile(tmp_path, header)
-            out.writePixels({'R': mask_float.tobytes(), 'G': mask_float.tobytes(), 'B': mask_float.tobytes()})
-            out.close()
-            with open(tmp_path, "rb") as f:
-                result_bytes = f.read()
-        finally:
-            os.unlink(tmp_path)
-        return {"result": result_bytes}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"Sequence processing failed: {str(e)}")
-        logger.error(f"Exception type: {type(e)}")
-        logger.error(f"Exception args: {e.args}")
-        raise HTTPException(status_code=500, detail=f"Sequence processing failed: {str(e)}")
+        bbox = [float(x) for x in bbox_str.split(",")]
+        if len(bbox) != 4:
+            raise ValueError("Bbox must have 4 values")
+        return np.array(bbox)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid bbox format: {str(e)}")
 
 @router.post("/process_exr")
 async def process_exr(
     image: UploadFile = File(...),
-    bbox: str = None,
-    frame_number: int = 1
+    bbox: str = Form(...),
+    as_file: bool = Query(False, description="Return mask as EXR file if true, else as list")
 ):
+    """Process a single EXR file."""
     try:
-        # Create temporary directory for processing
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+        # Parse bbox
+        bbox_array = parse_bbox(bbox)
+        
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.exr') as tmp:
+            contents = await image.read()
+            tmp.write(contents)
+            tmp_path = tmp.name
+        
+        try:
+            # Read EXR using OpenEXR
+            img = read_exr_to_numpy(tmp_path)
             
-            # Save uploaded file
-            input_path = temp_path / "input.exr"
-            with open(input_path, "wb") as f:
-                f.write(await image.read())
-            
-            # Read EXR file
-            frame = cv2.imread(str(input_path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-            if frame is None:
-                raise HTTPException(status_code=400, detail="Failed to read EXR file")
-            
-            # Get original dimensions
-            original_height, original_width = frame.shape[:2]
-            
-            # Convert to float32 if not already
-            frame = frame.astype(np.float32)
-            
-            # Normalize based on bit depth
-            if frame.dtype == np.uint8:
-                frame = frame / 255.0
-            elif frame.dtype == np.uint16:
-                frame = frame / 65535.0
-            elif frame.dtype == np.float32:
-                # Already in float format, no normalization needed
-                pass
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported bit depth")
-            
-            # Convert to RGB if needed
-            if len(frame.shape) == 2:
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-            elif frame.shape[2] == 4:  # RGBA
-                frame = frame[:, :, :3]  # Drop alpha channel
-            
-            # Resize to model input size (1024x1024)
-            model_size = 1024
-            frame = cv2.resize(frame, (model_size, model_size))
-            
-            # Convert to torch tensor and normalize
-            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1)
-            img_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)[:, None, None]
-            img_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)[:, None, None]
-            frame_tensor = (frame_tensor - img_mean) / img_std
-            
-            # Convert back to numpy and save as temporary file
-            frame_np = frame_tensor.permute(1, 2, 0).numpy()
-            processed_path = temp_path / "processed.exr"
-            cv2.imwrite(str(processed_path), frame_np)
+            if img is None:
+                raise HTTPException(status_code=400, detail="Failed to read image")
+
+            # Resize image to model's expected input size
+            image_size = getattr(processor.model, 'image_size', 256)  # Default to 256 if not set
+            if img.shape[0] != image_size or img.shape[1] != image_size:
+                img = cv2.resize(img, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
             
             # Process with SAM
-            if bbox:
-                bbox = [float(x) for x in bbox.split(",")]
-                # Scale bbox to model size
-                bbox = [
-                    bbox[0] * (model_size / original_width),
-                    bbox[1] * (model_size / original_height),
-                    bbox[2] * (model_size / original_width),
-                    bbox[3] * (model_size / original_height)
-                ]
-                mask = processor.generate_mask(str(processed_path), bbox)
+            result = await processor.generate_mask_async(img, bbox_array)
+            
+            if as_file:
+                # Save mask as EXR and return as file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.exr') as mask_tmp:
+                    write_exr(result.squeeze(), mask_tmp.name)
+                    return FileResponse(mask_tmp.name, media_type="image/exr", filename="mask.exr")
             else:
-                # If no bbox provided, use the whole image as bbox
-                bbox = [0, 0, model_size, model_size]
-                mask = processor.generate_mask(str(processed_path), bbox)
+                return {"result": result.tolist()}
             
-            # Resize mask back to original dimensions
-            mask = cv2.resize(mask, (original_width, original_height))
+        finally:
+            # Clean up temporary file
+            os.unlink(tmp_path)
             
-            # Save result
-            output_path = temp_path / "output.exr"
-            cv2.imwrite(str(output_path), mask.astype(np.float32))
-            
-            # Read and return result
-            with open(output_path, "rb") as f:
-                return {"result": f.read()}
-            
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"EXR processing failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"EXR processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/process_sequence")
+async def process_sequence(request: dict, as_file: bool = Query(False, description="Return masks as EXR files if true, else as list")):
+    """Process an EXR sequence."""
+    try:
+        sequence_path = request.get("sequence_path")
+        frame_range = request.get("frame_range", [1, 1])
+        bbox = request.get("bbox")
+        
+        if not sequence_path:
+            raise HTTPException(status_code=400, detail="Missing sequence_path")
+            
+        if not bbox:
+            raise HTTPException(status_code=400, detail="Missing bbox")
+            
+        # Parse bbox
+        bbox_array = parse_bbox(bbox)
+
+        # --- BEGIN: frame_range validation ---
+        if not (isinstance(frame_range, (list, tuple)) and len(frame_range) == 2):
+            raise ValueError("frame_range must be a list or tuple of two integers [start, end]")
+        start, end = frame_range
+        if not (isinstance(start, int) and isinstance(end, int)):
+            raise ValueError("frame_range values must be integers")
+        if start < 1 or end < 1:
+            raise ValueError("frame_range values must be >= 1")
+        if start > end:
+            raise ValueError("frame_range start must be <= end")
+        # --- END: frame_range validation ---
+        
+        # Create task for tracking
+        task_id = str(uuid.uuid4())
+        await progress_tracker.create_task(task_id)
+        
+        try:
+            # --- BEGIN: File/sequence existence check (moved inside inner try) ---
+            file_exists = False
+            if "%04d" in sequence_path or "%03d" in sequence_path:
+                frame_pattern = "%04d" if "%04d" in sequence_path else "%03d"
+                for frame_num in range(frame_range[0], frame_range[1] + 1):
+                    padded_frame = f"{frame_num:04d}" if frame_pattern == "%04d" else f"{frame_num:03d}"
+                    frame_path = sequence_path.replace(frame_pattern, padded_frame)
+                    if os.path.exists(frame_path):
+                        file_exists = True
+                        break
+            else:
+                file_exists = Path(sequence_path).exists()
+            if not file_exists:
+                raise FileNotFoundError(f"No file(s) found for sequence_path: {sequence_path}")
+            # --- END: File/sequence existence check ---
+
+            result = await processor.generate_mask_async(
+                sequence_path,
+                bbox_array,
+                frame_range=frame_range,
+                progress_callback=lambda p, m: progress_tracker.update_progress(task_id, p, m)
+            )
+            
+            await progress_tracker.complete_task(task_id, success=True)
+            if as_file:
+                # Save each mask as EXR and return list of file paths (for demo, return first mask as file)
+                if isinstance(result, np.ndarray) and result.ndim >= 3:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.exr') as mask_tmp:
+                        write_exr(result[0].squeeze(), mask_tmp.name)
+                        return FileResponse(mask_tmp.name, media_type="image/exr", filename="mask_seq_0.exr")
+                else:
+                    raise HTTPException(status_code=500, detail="Result is not a valid mask array")
+            else:
+                return {"result": result.tolist(), "task_id": task_id}
+            
+        except FileNotFoundError as e:
+            await progress_tracker.complete_task(task_id, success=False, error=str(e))
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            await progress_tracker.complete_task(task_id, success=False, error=str(e))
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            await progress_tracker.complete_task(task_id, success=False, error=str(e))
+            raise
+            
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.error(f"SAM processing failed for sequence: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"SAM processing failed for sequence: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.websocket("/ws/{task_id}")
+async def websocket_progress(websocket: WebSocket, task_id: str):
+    await websocket.accept()
+    try:
+        # Register this websocket connection for the task
+        if not hasattr(progress_tracker, 'connections'):
+            progress_tracker.connections = {}
+        if task_id not in progress_tracker.connections:
+            progress_tracker.connections[task_id] = set()
+        progress_tracker.connections[task_id].add(websocket)
+        # Send updates until task is done
+        while True:
+            status = progress_tracker.get_task_status(task_id)
+            if status:
+                await websocket.send_json(status.to_dict())
+                if status.status in ["completed", "failed"]:
+                    break
+            await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        if task_id in progress_tracker.connections:
+            progress_tracker.connections[task_id].discard(websocket)
+    except Exception as e:
+        await websocket.close(code=1011, reason=str(e))
+    finally:
+        if task_id in progress_tracker.connections:
+            progress_tracker.connections[task_id].discard(websocket)
