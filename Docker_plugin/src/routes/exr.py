@@ -1,5 +1,5 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 import numpy as np
 import OpenEXR
 import Imath
@@ -16,6 +16,8 @@ from src.utils.progress_tracker import ProgressTracker
 import uuid
 import asyncio
 import cv2
+import zipfile
+import io
 
 router = APIRouter()
 processor = SAMProcessor()
@@ -160,38 +162,64 @@ async def process_sequence(request: dict, as_file: bool = Query(False, descripti
         try:
             # --- BEGIN: File/sequence existence check (moved inside inner try) ---
             file_exists = False
-            if "%04d" in sequence_path or "%03d" in sequence_path:
+            frame_files = []
+            if isinstance(sequence_path, str) and ("%04d" in sequence_path or "%03d" in sequence_path):
                 frame_pattern = "%04d" if "%04d" in sequence_path else "%03d"
                 for frame_num in range(frame_range[0], frame_range[1] + 1):
                     padded_frame = f"{frame_num:04d}" if frame_pattern == "%04d" else f"{frame_num:03d}"
                     frame_path = sequence_path.replace(frame_pattern, padded_frame)
+                    print(f"[DEBUG] Checking: {frame_path} Exists: {os.path.exists(frame_path)}")
                     if os.path.exists(frame_path):
                         file_exists = True
-                        break
+                        frame_files.append(frame_path)
+                if not file_exists:
+                    raise FileNotFoundError(f"No file(s) found for sequence_path: {sequence_path}")
+            elif isinstance(sequence_path, str) and os.path.exists(sequence_path):
+                file_exists = True
+                frame_files = [sequence_path]
             else:
-                file_exists = Path(sequence_path).exists()
-            if not file_exists:
                 raise FileNotFoundError(f"No file(s) found for sequence_path: {sequence_path}")
             # --- END: File/sequence existence check ---
 
-            result = await processor.generate_mask_async(
-                sequence_path,
-                bbox_array,
-                frame_range=frame_range,
-                progress_callback=lambda p, m: progress_tracker.update_progress(task_id, p, m)
-            )
-            
-            await progress_tracker.complete_task(task_id, success=True)
+            # Process sequence and return a zip of EXR masks if as_file is True
             if as_file:
-                # Save each mask as EXR and return list of file paths (for demo, return first mask as file)
-                if isinstance(result, np.ndarray) and result.ndim >= 3:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.exr') as mask_tmp:
-                        write_exr(result[0].squeeze(), mask_tmp.name)
-                        return FileResponse(mask_tmp.name, media_type="image/exr", filename="mask_seq_0.exr")
-                else:
-                    raise HTTPException(status_code=500, detail="Result is not a valid mask array")
+                mask_paths = []
+                for idx, frame_path in enumerate(frame_files):
+                    # Read EXR frame
+                    img = read_exr_to_numpy(frame_path)
+                    if img is None:
+                        continue  # or handle error
+
+                    # Resize image to model's expected input size
+                    image_size = getattr(processor.model, 'image_size', 256)
+                    if img.shape[0] != image_size or img.shape[1] != image_size:
+                        img = cv2.resize(img, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+
+                    # Generate mask using the same logic as NukeSamurai
+                    mask = processor.generate_mask(img, bbox_array)
+
+                    # Save mask as EXR to a temp file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f'_mask_{idx}.exr') as mask_tmp:
+                        write_exr(mask.squeeze(), mask_tmp.name)
+                        mask_paths.append(mask_tmp.name)
+
+                # Create a zip file in memory
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w") as zipf:
+                    for mask_path in mask_paths:
+                        zipf.write(mask_path, arcname=os.path.basename(mask_path))
+                zip_buffer.seek(0)
+
+                # Clean up temp mask files
+                for mask_path in mask_paths:
+                    try:
+                        os.unlink(mask_path)
+                    except Exception:
+                        pass
+
+                return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=masks.zip"})
             else:
-                return {"result": result.tolist(), "task_id": task_id}
+                return {"result": frame_files, "task_id": task_id}
             
         except FileNotFoundError as e:
             await progress_tracker.complete_task(task_id, success=False, error=str(e))

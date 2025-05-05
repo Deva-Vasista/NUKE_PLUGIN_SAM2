@@ -15,6 +15,48 @@ sys.path.append(project_root)
 # Enable OpenEXR support in OpenCV
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+# Monkeypatch nuke.tprint, nuke.ProgressTask, and common stubs for environments without real Nuke
+try:
+    import nuke
+    if not hasattr(nuke, "tprint"):
+        def tprint(msg):
+            print("[NUKE TPRINT]", msg)
+        nuke.tprint = tprint
+    if not hasattr(nuke, "ProgressTask"):
+        class ProgressTask:
+            def __init__(self, name, total_steps=None):
+                self.name = name
+                self.total_steps = total_steps
+                self.current_step = 0
+                self._cancelled = False
+                print(f"[NUKE ProgressTask] Starting: {name}")
+            def setProgress(self, step):
+                self.current_step = step
+                print(f"[NUKE ProgressTask] Progress: {step}")
+            def setMessage(self, message):
+                print(f"[NUKE ProgressTask] Message: {message}")
+            def isCancelled(self):
+                return self._cancelled
+            def cancel(self):
+                self._cancelled = True
+                print(f"[NUKE ProgressTask] Cancelled: {self.name}")
+        nuke.ProgressTask = ProgressTask
+    # Patch other common Nuke stubs if needed
+    if not hasattr(nuke, "message"):
+        def message(msg):
+            print(f"[NUKE MESSAGE] {msg}")
+        nuke.message = message
+    if not hasattr(nuke, "executeInMainThreadWithResult"):
+        def executeInMainThreadWithResult(func, *args, **kwargs):
+            return func(*args, **kwargs)
+        nuke.executeInMainThreadWithResult = executeInMainThreadWithResult
+    if not hasattr(nuke, "executeInMainThread"):
+        def executeInMainThread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+        nuke.executeInMainThread = executeInMainThread
+except ImportError:
+    pass
+
 app = FastAPI(title="Nuke Samurai API", version="0.1.0")
 
 # Enable CORS
