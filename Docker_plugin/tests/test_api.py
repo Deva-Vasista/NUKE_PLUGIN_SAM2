@@ -154,4 +154,135 @@ async def test_batch_processing(client, sample_sequence):
     )
     assert response.status_code == 200
     assert "batch_id" in response.json()
-    assert "task_ids" in response.json() 
+    assert "task_ids" in response.json()
+
+def test_process_exr_points_positive(client, sample_exr):
+    """Test processing a single EXR file with positive points only."""
+    with open(sample_exr, "rb") as f:
+        files = {"image": ("test.exr", f, "application/octet-stream")}
+        data = {"points_positive": json.dumps([[10, 10], [20, 20]])}
+        response = client.post(
+            "/api/v1/process_exr",
+            files=files,
+            data=data
+        )
+    assert response.status_code == 200
+    assert "result" in response.json()
+
+def test_process_exr_points_negative(client, sample_exr):
+    """Test processing a single EXR file with negative points only."""
+    with open(sample_exr, "rb") as f:
+        files = {"image": ("test.exr", f, "application/octet-stream")}
+        data = {"points_negative": json.dumps([[30, 30], [40, 40]])}
+        response = client.post(
+            "/api/v1/process_exr",
+            files=files,
+            data=data
+        )
+    assert response.status_code == 200
+    assert "result" in response.json()
+
+def test_process_exr_bbox_and_points(client, sample_exr):
+    """Test processing a single EXR file with bbox and both positive/negative points."""
+    with open(sample_exr, "rb") as f:
+        files = {"image": ("test.exr", f, "application/octet-stream")}
+        data = {
+            "bbox": "0,0,50,50",
+            "points_positive": json.dumps([[10, 10]]),
+            "points_negative": json.dumps([[30, 30]])
+        }
+        response = client.post(
+            "/api/v1/process_exr",
+            files=files,
+            data=data
+        )
+    assert response.status_code == 200
+    assert "result" in response.json()
+
+def test_process_sequence_points_positive(client, sample_sequence):
+    """Test processing an EXR sequence with positive points only."""
+    request_data = {
+        "sequence_path": str(sample_sequence),
+        "frame_range": [1, 3],
+        "points_positive": json.dumps([[10, 10], [20, 20]])
+    }
+    response = client.post(
+        "/api/v1/process_sequence",
+        json=request_data
+    )
+    assert response.status_code == 200
+    assert "result" in response.json() or "task_id" in response.json()
+
+def test_process_sequence_bbox_and_points(client, sample_sequence):
+    """Test processing an EXR sequence with bbox and both positive/negative points."""
+    request_data = {
+        "sequence_path": str(sample_sequence),
+        "frame_range": [1, 3],
+        "bbox": "0,0,50,50",
+        "points_positive": json.dumps([[10, 10]]),
+        "points_negative": json.dumps([[30, 30]])
+    }
+    response = client.post(
+        "/api/v1/process_sequence",
+        json=request_data
+    )
+    assert response.status_code == 200
+    assert "result" in response.json() or "task_id" in response.json()
+
+def test_process_sequence_tracking_bbox(client, sample_sequence):
+    """Test sequence tracking with bbox only."""
+    request_data = {
+        "sequence_path": str(sample_sequence),
+        "frame_range": [1, 3],
+        "bbox": "0,0,50,50"
+    }
+    response = client.post(
+        "/api/v1/process_sequence",
+        json=request_data
+    )
+    assert response.status_code == 200
+    assert "result" in response.json() or "task_id" in response.json()
+
+def test_process_sequence_tracking_points_positive(client, sample_sequence):
+    """Test sequence tracking with positive points only."""
+    request_data = {
+        "sequence_path": str(sample_sequence),
+        "frame_range": [1, 3],
+        "points_positive": json.dumps([[10, 10], [20, 20]])
+    }
+    response = client.post(
+        "/api/v1/process_sequence",
+        json=request_data
+    )
+    assert response.status_code == 200
+    assert "result" in response.json() or "task_id" in response.json()
+
+def test_process_sequence_tracking_points_negative(client, sample_sequence):
+    """Test sequence tracking with negative points only."""
+    request_data = {
+        "sequence_path": str(sample_sequence),
+        "frame_range": [1, 3],
+        "points_negative": json.dumps([[30, 30], [40, 40]])
+    }
+    response = client.post(
+        "/api/v1/process_sequence",
+        json=request_data
+    )
+    assert response.status_code == 200
+    assert "result" in response.json() or "task_id" in response.json()
+
+def test_process_sequence_tracking_bbox_and_points(client, sample_sequence):
+    """Test sequence tracking with bbox and both positive/negative points."""
+    request_data = {
+        "sequence_path": str(sample_sequence),
+        "frame_range": [1, 3],
+        "bbox": "0,0,50,50",
+        "points_positive": json.dumps([[10, 10]]),
+        "points_negative": json.dumps([[30, 30]])
+    }
+    response = client.post(
+        "/api/v1/process_sequence",
+        json=request_data
+    )
+    assert response.status_code == 200
+    assert "result" in response.json() or "task_id" in response.json() 

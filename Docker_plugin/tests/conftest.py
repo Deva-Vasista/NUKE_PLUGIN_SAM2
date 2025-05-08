@@ -73,6 +73,14 @@ def mock_sam_model():
             masks = torch.ones((1, 1, h, w))
             yield 0, state["obj_ids"], masks
             
+        def predict(self, image, bbox=None, points_positive=None, points_negative=None, **kwargs):
+            # Return a dummy mask with the same height/width as the input image
+            if isinstance(image, np.ndarray):
+                h, w = image.shape[:2]
+            else:
+                h, w = 256, 256  # fallback
+            return np.ones((h, w), dtype=np.float32)
+            
     return MockSAM()
 
 @pytest.fixture(scope="session")
