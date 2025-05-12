@@ -78,7 +78,7 @@ This backend exposes the core functionality of the NukeSamurai plugin (object se
 ## 6. System Constraints & Considerations
 
 - **GPU Required**: For real-time/large-scale inference, a CUDA-capable GPU is needed.
-- **EXR Format**: Only EXR files/sequences are supported (matching VFX/Nuke workflows).
+- **EXR Format**: Only EXR files/sequences are supported for now(matching VFX/Nuke workflows).
 - **Statelessness**: No persistent session state; all prompts must be provided per request.
 - **Error Handling**: API returns clear HTTP errors, but some model errors may be cryptic (e.g., CUDA OOM, file not found).
 - **Performance**: For very large sequences, memory and inference time may be significant.

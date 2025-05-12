@@ -161,10 +161,10 @@ class SAMProcessor:
                 sequence_path,
                 frame_range_min=frame_range[0],
                 frame_range_max=frame_range[1],
-                original_fps=original_fps,
-                target_fps=target_fps,
-                bits=bits
-            )
+                    original_fps=original_fps,
+                    target_fps=target_fps,
+                    bits=bits
+                )
         except Exception as e:
             logger.error(f"[ERROR] Model init_state failed: {e}")
             raise

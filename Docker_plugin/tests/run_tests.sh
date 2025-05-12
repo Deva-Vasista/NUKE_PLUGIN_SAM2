@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Create virtual environment if it doesn't exist
-if [ ! -d ".NPP; then
+if [ ! -d ".venv"]; then
     python3 -m venv venv
 fi
 

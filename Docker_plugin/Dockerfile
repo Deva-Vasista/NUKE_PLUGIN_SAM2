@@ -1,46 +1,32 @@
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
-
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV OPENCV_IO_ENABLE_OPENEXR=1
+# Use official Python base image
+FROM python:3.10-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    python3-pip \
-    python3-dev \
-    git \
-    libopenexr-dev \
-    zlib1g-dev \
-    libjpeg-dev \
-    libpng-dev \
-    libtiff-dev \
+    build-essential \
+    libgl1 \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
+    ffmpeg \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
+# Set workdir
 WORKDIR /app
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+# Copy requirements first for caching
+COPY requirements.txt ./
 
 # Install Python dependencies
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Install OpenCV with OpenEXR support
-RUN pip3 install --no-cache-dir opencv-python-headless
+# Copy backend code
+COPY . /app
 
-# Copy the rest of the application
-COPY . .
+# Install SAM2 repo in editable mode
+RUN pip install -e NukeSamurai/sam2_repo
 
-# Create necessary directories
-RUN mkdir -p logs
-
-# Expose port
+# Expose FastAPI port
 EXPOSE 8000
 
-# Run the application
+# Default command to run the API server
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"] 

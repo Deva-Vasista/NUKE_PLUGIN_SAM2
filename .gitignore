@@ -2,7 +2,6 @@
 __pycache__/
 *.py[cod]
 *$py.class
-Docker_plugin/configs/*
 Test_files/*
 Output/*
 masks/*
