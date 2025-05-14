@@ -160,6 +160,7 @@ async def process_sequence(
     frame_range = request["frame_range"]
     bits = request.get("bits", "32-bit float")
     prompts = request.get("prompts", [])
+    reverse = request.get("reverse", False)
 
     # Load model/state
     state, images, frame_start = processor.model.init_state(
@@ -187,9 +188,9 @@ async def process_sequence(
     # Propagate
     start_frame_idx = 0
     max_frame_num_to_track = frame_range[1] - 1
-    logger.info(f"[API] Propagating: start_frame_idx={start_frame_idx}, max_frame_num_to_track={max_frame_num_to_track}")
+    logger.info(f"[API] Propagating: start_frame_idx={start_frame_idx}, max_frame_num_to_track={max_frame_num_to_track}, reverse={reverse}")
     masks_by_frame = {}
-    for frame_idx, object_ids, masks in processor.model.propagate_in_video(state, start_frame_idx=start_frame_idx, max_frame_num_to_track=max_frame_num_to_track):
+    for frame_idx, object_ids, masks in processor.model.propagate_in_video(state, start_frame_idx=start_frame_idx, max_frame_num_to_track=max_frame_num_to_track, reverse=reverse):
         masks_tensor = masks if isinstance(masks, torch.Tensor) else masks[0]
         if frame_idx not in masks_by_frame:
             masks_by_frame[frame_idx] = {}

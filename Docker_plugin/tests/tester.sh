@@ -68,7 +68,7 @@ curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
   -H "Content-Type: application/json" \
   -d '{
     "sequence_path": "/home/mappinga/projects/NPP/Test_files/frames/frame_%04d.exr",
-    "frame_range": [1, 100],
+    "frame_range": [1, 20],
     "prompts": [
       { "frame_index": 0, "object_id": 0, "points_positive": [[610,728]] },
       { "frame_index": 1, "object_id": 0, "points_positive": [[700,800]] },
@@ -79,37 +79,51 @@ curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
   }' \
   --output "$OUTDIR/masks_multiobj_multiframe.zip"
 
-# 7. Test /models/load
+# 7. Test /process_sequence with reverse tracking
+curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sequence_path": "/home/mappinga/projects/NPP/Test_files/frames/frame_%04d.exr",
+    "frame_range": [1, 5],
+    "reverse": true,
+    "prompts": [
+      { "frame_index": 3, "object_id": 0, "points_positive": [[610,728]] }
+    ],
+    "bits": "32-bit float"
+  }' \
+  --output "$OUTDIR/masks_reverse_tracking.zip"
+
+# 8. Test /models/load
 curl -X POST "http://localhost:8000/api/v1/models/load" \
   -H "Content-Type: application/json" \
   -d '{ "model_type": "large" }' \
   -o "$OUTDIR/model_load.json"
 
-# 8. Test /models/status
+# 9. Test /models/status
 curl -X GET "http://localhost:8000/api/v1/models/status" \
   -o "$OUTDIR/model_status.json"
 
-# 9. Test /models/unload
+# 10. Test /models/unload
 curl -X POST "http://localhost:8000/api/v1/models/unload" \
   -o "$OUTDIR/model_unload.json"
 
-# 10. Test /health
+# 11. Test /health
 curl -X GET "http://localhost:8000/api/v1/health" \
   -o "$OUTDIR/health.json"
 
-# 11. Test /gpu/info
+# 12. Test /gpu/info
 curl -X GET "http://localhost:8000/api/v1/gpu/info" \
   -o "$OUTDIR/gpu_info.json"
 
-# 12. Test /gpu/memory
+# 13. Test /gpu/memory
 curl -X GET "http://localhost:8000/api/v1/gpu/memory" \
   -o "$OUTDIR/gpu_memory.json"
 
-# 13. Test /gpu/clear-cache
+# 14. Test /gpu/clear-cache
 curl -X POST "http://localhost:8000/api/v1/gpu/clear-cache" \
   -o "$OUTDIR/gpu_clear_cache.json"
 
-# 14. Test /batch/process_batch
+# 15. Test /batch/process_batch
 curl -X POST "http://localhost:8000/api/v1/batch/process_batch" \
   -H "Content-Type: application/json" \
   -d '{
@@ -118,5 +132,9 @@ curl -X POST "http://localhost:8000/api/v1/batch/process_batch" \
     ]
   }' \
   -o "$OUTDIR/batch_process.json"
+
+# 16. Test /batch/{batch_id}/status (using a placeholder batch_id)
+curl -X GET "http://localhost:8000/api/v1/batch/123e4567-e89b-12d3-a456-426614174000/status" \
+  -o "$OUTDIR/batch_status.json"
 
 echo "All tests complete. Outputs saved in $OUTDIR"

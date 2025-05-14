@@ -3,9 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 Test_files/*
-Output/*
-masks/*
-masks.zip
+Docker_plugin/Output/*
+Docker_plugin/masks/*
+Docker_plugin/masks.zip
 Docker_plugin/debug_masks_out/*
 # C extensions
 *.so

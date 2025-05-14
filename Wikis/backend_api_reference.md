@@ -58,6 +58,7 @@ curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
 - `sequence_path`: (str, required) — Path pattern to EXR sequence (e.g., `/path/to/frames/frame_%04d.exr`).
 - `frame_range`: (list, required) — `[start, end]` (inclusive start, exclusive end).
 - `bits`: (str, optional) — Bit depth, default: `32-bit float`.
+- `reverse`: (bool, optional) — Whether to track in reverse time order, default: `false`.
 - `prompts`: (list, required) — List of prompt dicts:
   - `frame_index`: (int, required) — Frame index (0-based).
   - `object_id`: (int, optional) — Object ID (defaults to 0 if omitted).
@@ -73,6 +74,7 @@ curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
   -d '{
     "sequence_path": "/path/to/frames/frame_%04d.exr",
     "frame_range": [1, 20],
+    "reverse": false,
     "prompts": [
       { "frame_index": 0, "bbox": [454, 185, 500, 633] },
       { "frame_index": 10, "object_id": 1, "points_positive": [[1689, 216]] }
