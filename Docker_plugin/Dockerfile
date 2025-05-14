@@ -6,6 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV SAM2_BUILD_CUDA=1
+ENV PYTHONPATH=/app:/app/NukeSamurai/sam2_repo
+ENV HYDRA_FULL_ERROR=1
+ENV OPENCV_IO_ENABLE_OPENEXR=1
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -47,15 +50,16 @@ RUN cd NukeSamurai/sam2_repo && \
     pip install -e ".[notebooks]"
 
 # Download SAM2 model checkpoints
-RUN mkdir -p NukeSamurai/sam2_repo/sam2/checkpoints && \
-    cd NukeSamurai/sam2_repo/sam2/checkpoints && \
+RUN mkdir -p NukeSamurai/sam2_repo/checkpoints && \
+    cd NukeSamurai/sam2_repo/checkpoints && \
     if [ -f "download_ckpts.sh" ]; then \
-        chmod +x download_checkpoints.sh && \
-        ./download_checkpoints.sh; \
+        chmod +x download_ckpts.sh && \
+        ./download_ckpts.sh; \
     else \
         echo "Downloading checkpoints directly..."; \
         wget -q https://dl.fbaipublicfiles.com/segment_anything_2/sam2_tiny.pt || echo "Failed to download tiny model"; \
-        wget -q https://dl.fbaipublicfiles.com/segment_anything_2/sam2_b.pt || echo "Failed to download base model"; \
+        wget -q https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt || echo "Failed to download tiny model"; \
+        wget -q https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt || echo "Failed to download base_plus model"; \
     fi
 
 # Create output directory for API results

@@ -4,6 +4,85 @@ from NukeSamurai.sam2_repo.sam2.build_sam import build_sam2_video_predictor
 import os
 from loguru import logger
 import asyncio
+import re
+from collections.abc import Mapping, Sequence
+import functools
+
+# Global patches for tensor operations to avoid BFloat16 issues
+def patch_torch_operations():
+    """Apply global patches to torch operations to ensure float32 computation"""
+    logger.info("Applying global patches to torch operations to ensure float32 computation")
+    
+    # Set default tensor type to float32
+    torch.set_default_tensor_type(torch.FloatTensor)
+    
+    # Disable mixed precision
+    torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends.cudnn, 'allow_tf32'):
+        torch.backends.cudnn.allow_tf32 = False
+    
+    # Patch matrix multiplication operations
+    original_matmul = torch.matmul
+    original_bmm = torch.bmm
+    original_mm = torch.mm
+    original_linear = torch.nn.functional.linear
+    
+    @functools.wraps(original_matmul)
+    def patched_matmul(input, other, *, out=None):
+        if isinstance(input, torch.Tensor) and input.dtype != torch.float32:
+            input = input.to(torch.float32)
+        if isinstance(other, torch.Tensor) and other.dtype != torch.float32:
+            other = other.to(torch.float32)
+        return original_matmul(input, other, out=out)
+    
+    @functools.wraps(original_bmm)
+    def patched_bmm(input, mat2, *, out=None):
+        if isinstance(input, torch.Tensor) and input.dtype != torch.float32:
+            input = input.to(torch.float32)
+        if isinstance(mat2, torch.Tensor) and mat2.dtype != torch.float32:
+            mat2 = mat2.to(torch.float32)
+        return original_bmm(input, mat2, out=out)
+    
+    @functools.wraps(original_mm)
+    def patched_mm(input, mat2, *, out=None):
+        if isinstance(input, torch.Tensor) and input.dtype != torch.float32:
+            input = input.to(torch.float32)
+        if isinstance(mat2, torch.Tensor) and mat2.dtype != torch.float32:
+            mat2 = mat2.to(torch.float32)
+        return original_mm(input, mat2, out=out)
+    
+    @functools.wraps(original_linear)
+    def patched_linear(input, weight, bias=None):
+        if isinstance(input, torch.Tensor) and input.dtype != torch.float32:
+            input = input.to(torch.float32)
+        if isinstance(weight, torch.Tensor) and weight.dtype != torch.float32:
+            weight = weight.to(torch.float32)
+        if bias is not None and isinstance(bias, torch.Tensor) and bias.dtype != torch.float32:
+            bias = bias.to(torch.float32)
+        return original_linear(input, weight, bias)
+    
+    # Apply the patches
+    torch.matmul = patched_matmul
+    torch.bmm = patched_bmm
+    torch.mm = patched_mm
+    torch.nn.functional.linear = patched_linear
+    
+    # Patch tensor methods at the class level
+    original_tensor_matmul = torch.Tensor.__matmul__
+    
+    def patched_tensor_matmul(self, other):
+        if self.dtype != torch.float32:
+            self = self.to(torch.float32)
+        if isinstance(other, torch.Tensor) and other.dtype != torch.float32:
+            other = other.to(torch.float32)
+        return original_tensor_matmul(self, other)
+    
+    torch.Tensor.__matmul__ = patched_tensor_matmul
+    
+    logger.info("Successfully applied global patches for tensor operations")
+
+# Apply patches when module is imported
+patch_torch_operations()
 
 class SAMProcessor:
     _instance = None
@@ -53,7 +132,99 @@ class SAMProcessor:
                 device=self.device
             )
             
+            # Force conversion of all model parameters to float32
+            logger.info("Converting all model parameters to float32 to avoid dtype mismatches")
+            for name, param in self.model.named_parameters():
+                if param.dtype != torch.float32:
+                    logger.warning(f"Converting parameter {name} from {param.dtype} to float32")
+                    param.data = param.data.to(torch.float32)
+            
+            # Also convert model buffers
+            for name, buffer in self.model.named_buffers():
+                if hasattr(buffer, 'dtype') and buffer.dtype != torch.float32:
+                    logger.warning(f"Converting buffer {name} from {buffer.dtype} to float32")
+                    buffer.data = buffer.data.to(torch.float32)
+            
+            # Scan model for any BFloat16 tensors after initial conversion
+            self._scan_and_fix_bfloat16_tensors(self.model)
+            
+        # Set model to float32 computation mode
+        self.model.to(torch.float32)
         self.current_model = model_path
+        
+    def _scan_and_fix_bfloat16_tensors(self, model):
+        """Recursively scan model for any remaining BFloat16 tensors and convert them to Float32"""
+        
+        # Scan attributes that might contain tensors
+        for attr_name, attr_value in model.__dict__.items():
+            if isinstance(attr_value, torch.Tensor) and attr_value.dtype == torch.bfloat16:
+                logger.warning(f"Found BFloat16 tensor in model attributes: {attr_name}")
+                model.__dict__[attr_name] = attr_value.to(torch.float32)
+            elif isinstance(attr_value, (list, tuple)):
+                # Handle lists or tuples of tensors
+                for i, item in enumerate(attr_value):
+                    if isinstance(item, torch.Tensor) and item.dtype == torch.bfloat16:
+                        if isinstance(attr_value, list):
+                            attr_value[i] = item.to(torch.float32)
+                        else:  # tuple can't be modified
+                            new_tuple = list(attr_value)
+                            new_tuple[i] = item.to(torch.float32)
+                            model.__dict__[attr_name] = tuple(new_tuple)
+            elif isinstance(attr_value, dict):
+                # Handle dictionaries containing tensors
+                for k, v in attr_value.items():
+                    if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16:
+                        attr_value[k] = v.to(torch.float32)
+        
+        # Recursively check child modules
+        for child_name, child_module in model.named_children():
+            self._scan_and_fix_bfloat16_tensors(child_module)
+
+    def _convert_windows_to_wsl_path(self, path: str) -> str:
+        """Convert Windows path to WSL-compatible path if needed"""
+        if path.startswith("C:") or path.startswith("c:"):
+            drive_letter = path[0].lower()
+            path_part = path[3:]
+            path_part = path_part.replace('\\', '/')
+            wsl_path = f"/mnt/{drive_letter}/{path_part}"
+            logger.info(f"Converting Windows path '{path}' to WSL path '{wsl_path}'")
+            return wsl_path
+        return path
+    
+    def _convert_tensors_to_float32(self, obj):
+        """Recursively convert all tensors in a nested structure to float32"""
+        if isinstance(obj, torch.Tensor) and obj.dtype != torch.float32:
+            return obj.to(torch.float32)
+        elif isinstance(obj, Mapping):
+            return {k: self._convert_tensors_to_float32(v) for k, v in obj.items()}
+        elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+            return [self._convert_tensors_to_float32(x) for x in obj]
+        else:
+            return obj
+    
+    def patched_init_state(self, *args, **kwargs):
+        """Patched version of init_state that handles Windows paths"""
+        # Convert sequence_path if it's a Windows path
+        if args and len(args) > 0:
+            args = list(args)
+            args[0] = self._convert_windows_to_wsl_path(args[0])
+            args = tuple(args)
+        elif 'video_path' in kwargs:
+            kwargs['video_path'] = self._convert_windows_to_wsl_path(kwargs['video_path'])
+        
+        # Call the original init_state method with converted paths
+        state, images, frame_start = self.model.init_state(*args, **kwargs)
+        
+        # Ensure all tensors in the state are float32
+        with torch.no_grad():
+            # Convert images to float32 if not already
+            if isinstance(images, torch.Tensor) and images.dtype != torch.float32:
+                images = images.to(torch.float32)
+            
+            # Convert relevant tensors in state to float32
+            state = self._convert_tensors_to_float32(state)
+        
+        return state, images, frame_start
         
     def generate_mask(self, image, bbox=None, points_positive=None, points_negative=None, frame_range=None, original_fps=24, target_fps=24, bits=32):
         """
@@ -157,14 +328,18 @@ class SAMProcessor:
             return [self.generate_mask(dummy_img, bbox, points_positive, points_negative) for _ in range(num_frames)]
         # --- Real model logic ---
         try:
-            state, images, frame_start = self.model.init_state(
+            # Convert Windows path to WSL path if needed
+            sequence_path = self._convert_windows_to_wsl_path(sequence_path)
+            
+            # Use patched init_state to handle paths
+            state, images, frame_start = self.patched_init_state(
                 sequence_path,
                 frame_range_min=frame_range[0],
                 frame_range_max=frame_range[1],
-                    original_fps=original_fps,
-                    target_fps=target_fps,
-                    bits=bits
-                )
+                original_fps=original_fps,
+                target_fps=target_fps,
+                bits=bits
+            )
         except Exception as e:
             logger.error(f"[ERROR] Model init_state failed: {e}")
             raise
@@ -193,10 +368,14 @@ class SAMProcessor:
             raise ValueError("Must provide at least bbox or points.")
         if debug:
             logger.info(f"[DEBUG] Adding prompt: {prompt_type}")
+            
+        # Make sure tensors are float32
         points_tensor = torch.tensor(points, dtype=torch.float32) if points else None
         labels_tensor = torch.tensor(labels, dtype=torch.int32) if labels else None
         box_tensor = torch.tensor(bbox, dtype=torch.float32) if bbox is not None else None
+        
         try:
+            # Add prompt with the right type
             if prompt_type == 'bbox':
                 self.model.add_new_points_or_box(state, frame_idx, obj_id, box=box_tensor)
             elif prompt_type == 'points':
@@ -206,26 +385,69 @@ class SAMProcessor:
             else:
                 logger.error(f"[ERROR] Unknown prompt_type: {prompt_type}")
                 raise ValueError(f"Unknown prompt_type: {prompt_type}")
+                
+            # Make sure state tensors are float32 after adding prompt
+            with torch.no_grad():
+                state = self._convert_tensors_to_float32(state)
+                
         except Exception as e:
             logger.error(f"[ERROR] add_new_points_or_box failed: {e}")
             raise
-        # 3. Propagate masks through the sequence
+            
+        # Debug logging
         if debug:
             logger.info(f"[DEBUG] propagate_in_video: state type={type(state)}, frame_start={frame_start}, frame_range={frame_range}, images shape={getattr(images, 'shape', None)}")
             logger.info(f"[DEBUG] state keys: {list(state.keys())}")
             logger.info(f"[DEBUG] state['images'] shape: {getattr(state.get('images', None), 'shape', None)}")
             logger.info(f"[DEBUG] state['num_frames']: {state.get('num_frames', None)}")
+            
+        # Propagate masks
         masks_list = []
         try:
-            for idx, (a, b, masks) in enumerate(self.model.propagate_in_video(
-                state,
-                start_frame_idx=frame_start,
-                max_frame_num_to_track=frame_range[1] - frame_range[0] + 1
-            )):
-                if debug:
-                    logger.info(f"[DEBUG] propagate_in_video yielded idx={idx}, masks type={type(masks)}, shape={getattr(masks, 'shape', None)}")
-                masks_list.append(masks.cpu().numpy())
+            # Create a wrapper to convert tensors during propagation
+            def propagate_with_conversion():
+                for idx, (frame_idx, object_ids, masks) in enumerate(self.model.propagate_in_video(
+                    state,
+                    start_frame_idx=frame_start,
+                    max_frame_num_to_track=frame_range[1] - frame_range[0] + 1
+                )):
+                    # Ensure masks are float32 before yielding
+                    if masks.dtype != torch.float32:
+                        masks = masks.to(torch.float32)
+                    if debug:
+                        logger.info(f"[DEBUG] propagate_in_video yielded idx={idx}, masks type={type(masks)}, shape={getattr(masks, 'shape', None)}, dtype={masks.dtype}")
+                    masks_list.append(masks.cpu().numpy())
+                    yield frame_idx, object_ids, masks
+                    
+            # Apply the conversion during propagation
+            for _ in propagate_with_conversion():
+                pass
+                
+        except RuntimeError as e:
+            if "expected scalar type Float but found BFloat16" in str(e):
+                logger.error(f"[ERROR] Data type mismatch (BFloat16 vs Float): {e}")
+                logger.info("[INFO] Attempting to recover by forcing model components to float32...")
+                # If we got here, try a last resort recovery
+                try:
+                    for module in self.model.modules():
+                        for param in module.parameters():
+                            if param.dtype != torch.float32:
+                                param.data = param.data.to(torch.float32)
+                    # Try propagation again
+                    for idx, (_, _, masks) in enumerate(self.model.propagate_in_video(
+                        state,
+                        start_frame_idx=frame_start,
+                        max_frame_num_to_track=frame_range[1] - frame_range[0] + 1
+                    )):
+                        masks_list.append(masks.cpu().numpy())
+                except Exception as recovery_e:
+                    logger.error(f"[ERROR] Recovery attempt failed: {recovery_e}")
+                    raise
+            else:
+                logger.error(f"[ERROR] propagate_in_video failed: {e}")
+                raise
         except Exception as e:
             logger.error(f"[ERROR] propagate_in_video failed: {e}")
             raise
+            
         return masks_list

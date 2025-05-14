@@ -1,8 +1,8 @@
 import nuke
 
-### SAMURAI
-from scripts.nuke_samurai import CreateSamuraiNode, UpdatePath, GenerateMask, BoundingBox, InputInfos
+### SAM2
+from scripts.NukeSAM2 import CreateSAM2Node, UpdatePath, GenerateMask, BoundingBox, InputInfos
 
 m = nuke.menu('Nodes')
-m = m.addCommand('SAMURAI', 'CreateSamuraiNode()', tooltip="SAMURAI", icon="samurai_icon.png")
+m = m.addCommand('SAMURAI', 'CreateSAM2Node()', tooltip="SAMURAI", icon="samurai_icon.png")
 ###

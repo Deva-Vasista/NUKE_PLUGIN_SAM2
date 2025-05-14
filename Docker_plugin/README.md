@@ -51,9 +51,9 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -e .
 
 # Download SAM2 model checkpoints
-cd NukeSamurai/sam2_repo/sam2/checkpoints
-chmod +x download_checkpoints.sh
-./download_checkpoints.sh
+cd NukeSamurai/sam2_repo/checkpoints
+chmod +x download_ckpts.sh
+./download_ckpts.sh
 cd ../../../../
 
 # Run the server
@@ -123,6 +123,7 @@ When using Docker, you can customize the deployment with these environment varia
 - `CUDA_VISIBLE_DEVICES`: GPU device ID to use (default: 0, set to empty for CPU)
 - `DEBUG`: Enable debug logging (default: false)
 - `SAM2_BUILD_CUDA`: Enable CUDA builds (default: 1, set to 0 for CPU-only)
+- `OPENCV_IO_ENABLE_OPENEXR`: Enable OpenEXR support in OpenCV (default: 1)
 
 Example:
 

@@ -16,7 +16,7 @@ services:
       # Mount output directory for results
       - ${OUTPUT_PATH:-./Output}:/app/Output
       # Optional: Mount model checkpoints for persistence
-      - ${CHECKPOINTS_PATH:-./checkpoints}:/app/NukeSamurai/sam2_repo/sam2/checkpoints
+      - ${CHECKPOINTS_PATH:-./checkpoints}:/app/NukeSamurai/sam2_repo/checkpoints
     environment:
       # Set to 'cpu' if no GPU is available
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
@@ -24,6 +24,8 @@ services:
       - DEBUG=${DEBUG:-false}
       # Set to 0 to disable CUDA builds
       - SAM2_BUILD_CUDA=${SAM2_BUILD_CUDA:-1}
+      # Enable OpenEXR support in OpenCV
+      - OPENCV_IO_ENABLE_OPENEXR=1
     deploy:
       resources:
         reservations:
@@ -52,10 +54,11 @@ services:
     volumes:
       - ${EXR_DATA_PATH:-./Test_files}:/data
       - ${OUTPUT_PATH:-./Output}:/app/Output
-      - ${CHECKPOINTS_PATH:-./checkpoints}:/app/NukeSamurai/sam2_repo/sam2/checkpoints
+      - ${CHECKPOINTS_PATH:-./checkpoints}:/app/NukeSamurai/sam2_repo/checkpoints
     environment:
       - CUDA_VISIBLE_DEVICES=""
       - DEBUG=${DEBUG:-false}
       - SAM2_BUILD_CUDA=0
+      - OPENCV_IO_ENABLE_OPENEXR=1
     profiles: ["cpu"]
     command: ["--host", "0.0.0.0", "--port", "8000", "--reload"] 

@@ -74,9 +74,11 @@ class ProgressTracker:
         if success:
             status.status = "completed"
             status.progress = 100
+            status.message = "Processing completed successfully"
         else:
             status.status = "failed"
             status.error = error
+            status.message = f"Processing failed: {error}"
 
         # Notify all connected clients
         if task_id in self.connections:
