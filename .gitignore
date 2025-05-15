@@ -7,6 +7,7 @@ Docker_plugin/Output/*
 Docker_plugin/masks/*
 Docker_plugin/masks.zip
 Docker_plugin/debug_masks_out/*
+rebuild.sh
 # C extensions
 *.so
 

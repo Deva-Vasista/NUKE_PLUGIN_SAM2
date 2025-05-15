@@ -422,7 +422,7 @@ class SAMProcessor:
             # Apply the conversion during propagation
             for _ in propagate_with_conversion():
                 pass
-                
+                    
         except RuntimeError as e:
             if "expected scalar type Float but found BFloat16" in str(e):
                 logger.error(f"[ERROR] Data type mismatch (BFloat16 vs Float): {e}")
@@ -451,3 +451,43 @@ class SAMProcessor:
             raise
             
         return masks_list
+
+    def reset_state(self):
+        """Reset the model state and clear any cached data."""
+        try:
+            if self.model is not None:
+                # Clear model state using SAM2's built-in reset functionality
+                if hasattr(self.model, 'reset_state') and self.current_state is not None:
+                    self.model.reset_state(self.current_state)
+                
+                # Clear any cached features
+                if hasattr(self.model, 'cached_features'):
+                    self.model.cached_features = {}
+                
+                # Reset tracking state
+                if hasattr(self.model, 'tracking_has_started'):
+                    self.model.tracking_has_started = False
+                if hasattr(self.model, 'frames_already_tracked'):
+                    self.model.frames_already_tracked = {}
+                
+                # Clear object tracking data
+                if hasattr(self.model, 'obj_id_to_idx'):
+                    self.model.obj_id_to_idx = {}
+                if hasattr(self.model, 'obj_idx_to_id'):
+                    self.model.obj_idx_to_id = {}
+                if hasattr(self.model, 'obj_ids'):
+                    self.model.obj_ids = []
+            
+            # Clear instance state
+            self.current_state = None
+            
+            # Force GPU memory cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            logger.info("Successfully reset model state and cleared cache")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during model state reset: {e}")
+            raise RuntimeError(f"Failed to reset model state: {e}")

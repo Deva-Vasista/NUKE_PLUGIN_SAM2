@@ -651,3 +651,33 @@ async def get_task_status(task_id: str):
         return convert_response(status.to_dict())
     else:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+@router.post("/reset")
+async def reset_model_state():
+    """Reset the model state and clear any cached data."""
+    try:
+        # Reset the SAM processor
+        success = processor.reset_state()
+        if not success:
+            raise RuntimeError("Failed to reset SAM processor state")
+        
+        # Clear progress tracker
+        try:
+            progress_tracker.clear_all()
+        except Exception as e:
+            logger.warning(f"Non-critical error clearing progress tracker: {e}")
+        
+        # Force GPU memory cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return {
+            "status": "success",
+            "message": "Model state reset successfully"
+        }
+    except Exception as e:
+        logger.error(f"Error resetting model state: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reset model state: {str(e)}"
+        )

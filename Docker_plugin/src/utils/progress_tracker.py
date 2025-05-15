@@ -118,4 +118,18 @@ class ProgressTracker:
         for task_id in to_remove:
             del self.tasks[task_id]
             if task_id in self.connections:
-                del self.connections[task_id] 
+                del self.connections[task_id]
+
+    def clear_all(self):
+        """Clear all tasks and connections."""
+        # Close all websocket connections
+        for task_id, connections in self.connections.items():
+            for websocket in connections:
+                try:
+                    asyncio.create_task(websocket.close())
+                except:
+                    pass
+        
+        # Clear all tasks and connections
+        self.tasks.clear()
+        self.connections.clear() 

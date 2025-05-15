@@ -14,6 +14,226 @@ import time
 API_BASE_URL = "http://localhost:8000"
 API_VERSION = "v1"
 
+class ThreadedTask:
+    """Helper class to run API requests in background threads"""
+    def __init__(self, on_complete=None, on_progress=None, on_error=None):
+        self.on_complete = on_complete or (lambda result: None)
+        self.on_progress = on_progress or (lambda progress, message: None)
+        self.on_error = on_error or (lambda error: None)
+        self.thread = None
+        self.running = False
+        self.task_id = None
+        self._error_reported = False
+        
+    def run_in_background(self, func, *args, **kwargs):
+        """Run the provided function in a background thread"""
+        self.thread = threading.Thread(target=self._run_task, args=(func, args, kwargs))
+        self.thread.daemon = True
+        self.running = True
+        self._error_reported = False
+        self.thread.start()
+        return self
+        
+    def _run_task(self, func, args, kwargs):
+        """Internal method to execute the task and handle callbacks"""
+        try:
+            result = func(*args, **kwargs)
+            if self.running:  # Check if we've been cancelled
+                nuke.executeInMainThread(lambda: self.on_complete(result))
+        except Exception as e:
+            if self.running:  # Check if we've been cancelled
+                self._error_reported = True
+                error_msg = str(e)
+                nuke.executeInMainThread(lambda: self.on_error(error_msg))
+                # Also update status to show the error
+                try:
+                    nuke.executeInMainThread(lambda msg=error_msg: update_status_safely(f"Error: {msg}"))
+                except:
+                    pass
+        finally:
+            self.running = False
+            
+    def cancel(self):
+        """Cancel the running task"""
+        self.running = False
+        if self.task_id:
+            # Try to cancel the task on the server too
+            try:
+                requests.post(f"{API_BASE_URL}/api/{API_VERSION}/cancel/{self.task_id}")
+            except:
+                pass  # Ignore errors when cancelling
+    
+    def report_error(self, error_msg):
+        """Report an error and set the error flag"""
+        self._error_reported = True
+        nuke.executeInMainThread(lambda err=error_msg: self.on_error(err))
+        # Also update status to show the error
+        try:
+            nuke.executeInMainThread(lambda msg=error_msg: update_status_safely(f"Error: {msg}"))
+        except:
+            pass
+
+    def start_progress_monitor(self, task_id):
+        """Start monitoring progress for a task"""
+        self.task_id = task_id
+        monitor_thread = threading.Thread(target=self._monitor_progress_thread, args=(task_id,))
+        monitor_thread.daemon = True
+        monitor_thread.start()
+        
+    def _monitor_progress_thread(self, task_id):
+        """Background thread to monitor progress via HTTP polling"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._monitor_progress_async(task_id))
+        finally:
+            loop.close()
+        
+    async def _monitor_progress_async(self, task_id):
+        """Async method to monitor progress via WebSocket"""
+        uri = f"ws://localhost:8000/api/{API_VERSION}/ws/{task_id}"
+        completed = False
+        connection_attempts = 0
+        max_connection_attempts = 3
+        
+        while connection_attempts < max_connection_attempts and self.running:
+            try:
+                async with websockets.connect(uri, ping_timeout=20, close_timeout=10) as websocket:
+                    connection_attempts = 0  # Reset counter on successful connection
+                    nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection established, monitoring progress..."))
+                    
+                    # Keep track of last progress value
+                    last_progress = 0
+                    stuck_count = 0
+                    max_stuck_count = 10  # Exit after being stuck for a while
+                    
+                    # Add timeout for the entire monitoring process
+                    start_time = time.time()
+                    max_websocket_time = 300  # 5 minutes maximum
+                    
+                    while self.running:
+                        # Check for timeout
+                        if time.time() - start_time > max_websocket_time:
+                            nuke.executeInMainThread(lambda: nuke.tprint(f"WebSocket monitoring timed out after {max_websocket_time} seconds"))
+                            break
+                            
+                        try:
+                            # Use timeout to prevent waiting forever
+                            data = await asyncio.wait_for(websocket.recv(), timeout=30)
+                            progress_data = json.loads(data)
+                            
+                            # Get progress details
+                            progress = progress_data.get('progress', 0)
+                            message = progress_data.get('message', '')
+                            status = progress_data.get('status', 'running')
+                            
+                            # Update UI in main thread
+                            nuke.executeInMainThread(lambda p=progress, m=message: self.on_progress(p, m))
+                            
+                            # Check if progress is stuck
+                            if progress == last_progress:
+                                stuck_count += 1
+                                if stuck_count >= max_stuck_count:
+                                    nuke.executeInMainThread(lambda: nuke.tprint(f"Progress stuck at {progress}% for {max_stuck_count} updates, exiting monitor"))
+                                    break
+                            else:
+                                stuck_count = 0
+                                last_progress = progress
+                            
+                            # Exit if task is completed or failed
+                            if status in ['completed', 'failed']:
+                                if status == 'completed':
+                                    # Ensure we get to 100% when complete
+                                    completed = True
+                                    nuke.executeInMainThread(lambda: self.on_progress(100, "Processing completed successfully"))
+                                
+                                if status == 'failed':
+                                    error = progress_data.get('error', 'Unknown error')
+                                    nuke.executeInMainThread(lambda e=error: self.on_error(f"Task failed: {e}"))
+                                break
+                                
+                        except asyncio.TimeoutError:
+                            # Timeout waiting for messages, check if connection is still alive
+                            try:
+                                pong_event = await websocket.ping()
+                                await asyncio.wait_for(pong_event, timeout=5)
+                                # Ping succeeded, continue monitoring
+                                nuke.executeInMainThread(lambda: nuke.tprint("WebSocket ping successful, connection still active"))
+                            except asyncio.TimeoutError:
+                                # Server did not respond to ping
+                                nuke.executeInMainThread(lambda: nuke.tprint("WebSocket ping failed, reconnecting..."))
+                                break
+                            except Exception as ping_error:
+                                nuke.executeInMainThread(lambda e=ping_error: nuke.tprint(f"Error pinging WebSocket: {e}"))
+                                break
+                        except Exception as e:
+                            # Error receiving progress update
+                            nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error receiving WebSocket data: {e}"))
+                            await asyncio.sleep(2)
+                    
+                    # If we reached here and task is completed, we're done
+                    if completed:
+                        return
+                        
+            except Exception as connection_error:
+                # WebSocket connection error, try again or fall back to HTTP polling
+                connection_attempts += 1
+                nuke.executeInMainThread(lambda e=connection_error: 
+                    nuke.tprint(f"WebSocket connection error (attempt {connection_attempts}/{max_connection_attempts}): {e}"))
+                if connection_attempts < max_connection_attempts:
+                    await asyncio.sleep(2)  # Wait before retrying
+                    continue
+                else:
+                    # All connection attempts failed, fall back to HTTP polling
+                    nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection failed, falling back to HTTP polling"))
+                    break
+        
+        # Fall back to HTTP polling if WebSocket failed
+        try:
+            # Poll the server for status every 3 seconds
+            status_url = f"{API_BASE_URL}/api/{API_VERSION}/status/{task_id}"
+            polling_start_time = time.time()
+            max_polling_time = 300  # 5 minutes maximum
+            
+            while self.running and time.time() - polling_start_time < max_polling_time:
+                try:
+                    status_response = requests.get(status_url, timeout=5)
+                    if status_response.status_code == 200:
+                        # Parse status update
+                        status_data = status_response.json()
+                        progress = status_data.get('progress', 0)
+                        message = status_data.get('message', '')
+                        status = status_data.get('status', 'running')
+                        
+                        # Update progress in main thread
+                        nuke.executeInMainThread(lambda p=progress, m=message: self.on_progress(p, m))
+                        
+                        # Exit if task is completed or failed
+                        if status in ['completed', 'failed']:
+                            if status == 'completed':
+                                # Ensure we get to 100% when complete
+                                completed = True
+                                nuke.executeInMainThread(lambda: self.on_progress(100, "Processing completed successfully"))
+                            
+                            if status == 'failed':
+                                error = status_data.get('error', 'Unknown error')
+                                nuke.executeInMainThread(lambda e=error: self.on_error(f"Task failed: {e}"))
+                            break
+                except requests.exceptions.RequestException as e:
+                    nuke.executeInMainThread(lambda e=e: nuke.tprint(f"HTTP polling error: {e}"))
+                
+                await asyncio.sleep(3)
+                
+            if time.time() - polling_start_time >= max_polling_time:
+                nuke.executeInMainThread(lambda: nuke.tprint("HTTP polling timed out"))
+        except Exception as e:
+            nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error in HTTP polling fallback: {e}"))
+        
+        # Make sure we always set 100% when completing download and no error was reported
+        # This handles cases where the WebSocket disconnects before final update
+        if not completed and self.running and not hasattr(self, '_error_reported'):
+            nuke.executeInMainThread(lambda: self.on_progress(100, "Download completed"))
+
 class Prompt:
     def __init__(self):
         self.frame_index = 0
@@ -51,7 +271,6 @@ class BoundingBox:
     current_frame = None
     min_frame = None
     max_frame = None
-    current_object_id = 0
 
     @classmethod
     def getBbox(cls):
@@ -62,9 +281,6 @@ class BoundingBox:
         cls.min_frame = int(nuke.thisNode().knob('FrameRangeMin').value())
         cls.max_frame = int(nuke.thisNode().knob('FrameRangeMax').value())
         cls.current_frame = cls.min_frame
-        
-        # Initialize with object_id 0 by default
-        cls.current_object_id = 0
 
         def get_frame_path(frame_num):
             if "%04d" in input_file_name:
@@ -75,7 +291,7 @@ class BoundingBox:
 
         cls.input_path = get_frame_path(cls.current_frame)
         
-        window_name = "Selection - Left/Right arrows to change frame, Left click and drag for box, 'p' for positive point, 'n' for negative point, '1-9' to set object ID, 'z' to undo, 'r' to reset, 'q' to finish"
+        window_name = "Selection - Left/Right arrows to change frame, Left click and drag for box, 'p' for positive point, 'n' for negative point, 'z' to undo, 'r' to reset, 'q' to finish"
         cv2.namedWindow(window_name, 0)
         cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
         cv2.resizeWindow(window_name, 1280, 720)
@@ -92,15 +308,30 @@ class BoundingBox:
                 if cls.drawing_box:
                     cls.drawing_box = False
                     if cls.current_box[2] > 0 and cls.current_box[3] > 0:
-                        # Create new prompt
-                        prompt = Prompt()
-                        prompt.frame_index = cls.current_frame
-                        prompt.object_id = cls.current_object_id
+                        # Get current object ID from node
+                        try:
+                            current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
+                        except:
+                            current_obj_id = 0
+                            
+                        # Create new prompt or find existing one
+                        prompt = None
+                        for p in cls.prompts:
+                            if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
+                                prompt = p
+                                break
+                        
+                        if prompt is None:
+                            prompt = Prompt()
+                            prompt.frame_index = cls.current_frame
+                            prompt.object_id = current_obj_id
+                            cls.prompts.append(prompt)
+                        
+                        # Add bbox to prompt
                         prompt.bbox = [cls.current_box[0], cls.current_box[1], 
                                      cls.current_box[0] + cls.current_box[2], 
                                      cls.current_box[1] + cls.current_box[3]]
-                        cls.prompts.append(prompt)
-                        nuke.tprint(f"Added box on frame {cls.current_frame} for object {cls.current_object_id}: {prompt.bbox}")
+                        nuke.tprint(f"Added box for object {current_obj_id} on frame {cls.current_frame}: {prompt.bbox}")
                     cls.current_box = None
 
         # Dictionary to store current mouse position
@@ -116,45 +347,30 @@ class BoundingBox:
             # Draw existing boxes and points for current frame
             for prompt in cls.prompts:
                 if prompt.frame_index == cls.current_frame:
-                    # Use different colors for different object IDs
-                    color_r = (prompt.object_id * 40) % 255
-                    color_g = (prompt.object_id * 80 + 100) % 255
-                    color_b = (prompt.object_id * 120 + 50) % 255
-                    
-                    # Box color based on object ID
-                    object_color = (color_b, color_g, color_r)
-                    
                     if prompt.bbox:
                         x1, y1, x2, y2 = prompt.bbox
-                        cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), object_color, 2)
-                        cv2.putText(img_with_boxes, f"Obj {prompt.object_id}", (x1, y1-5), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, object_color, 2)
+                        cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(img_with_boxes, str(prompt.object_id + 1), (x1, y1-5), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                     
                     for point in prompt.points_positive:
-                        cv2.circle(img_with_boxes, point, 5, object_color, -1)
-                        cv2.putText(img_with_boxes, f"+{prompt.object_id}", (point[0]-5, point[1]-5), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, object_color, 2)
+                        cv2.circle(img_with_boxes, point, 5, (0, 255, 0), -1)
+                        cv2.putText(img_with_boxes, "+", (point[0]-5, point[1]-5), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                     
                     for point in prompt.points_negative:
                         cv2.circle(img_with_boxes, point, 5, (0, 0, 255), -1)
-                        cv2.putText(img_with_boxes, f"-{prompt.object_id}", (point[0]-5, point[1]-5), 
+                        cv2.putText(img_with_boxes, "-", (point[0]-5, point[1]-5), 
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
             # Draw current box being drawn
             if cls.drawing_box and cls.current_box:
                 x, y, w, h = cls.current_box
-                
-                # Color for current object ID
-                color_r = (cls.current_object_id * 40) % 255
-                color_g = (cls.current_object_id * 80 + 100) % 255
-                color_b = (cls.current_object_id * 120 + 50) % 255
-                object_color = (color_b, color_g, color_r)
-                
-                cv2.rectangle(img_with_boxes, (x, y), (x + w, y + h), object_color, 2)
+                cv2.rectangle(img_with_boxes, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
             # Create a semi-transparent overlay for better text visibility
             overlay = img_with_boxes.copy()
-            cv2.rectangle(overlay, (0, 0), (600, 400), (0, 0, 0), -1)
+            cv2.rectangle(overlay, (0, 0), (400, 350), (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.7, img_with_boxes, 0.3, 0, img_with_boxes)
 
             # Show instructions
@@ -166,38 +382,27 @@ class BoundingBox:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.putText(img_with_boxes, "Press 'n' to add negative point", (10, 120), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, "Press '1-9' to set object ID", (10, 150), 
+            cv2.putText(img_with_boxes, "Press 'z' to undo last action", (10, 150), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, "Press 'z' to undo last action", (10, 180), 
+            cv2.putText(img_with_boxes, "Press 'r' to reset current frame", (10, 180), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, "Press 'r' to reset current frame", (10, 210), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, "Press 'q' to finish", (10, 240), 
+            cv2.putText(img_with_boxes, "Press 'q' to finish", (10, 210), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Show current frame, object ID, and selection counts
+            # Show current frame and selection counts
             current_prompts = [p for p in cls.prompts if p.frame_index == cls.current_frame]
             boxes_count = sum(1 for p in current_prompts if p.bbox)
             pos_points = sum(len(p.points_positive) for p in current_prompts)
             neg_points = sum(len(p.points_negative) for p in current_prompts)
 
-            cv2.putText(img_with_boxes, f"Current Frame: {cls.current_frame}", (10, 280), 
+            cv2.putText(img_with_boxes, f"Current Frame: {cls.current_frame}", (10, 250), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, f"Current Object ID: {cls.current_object_id}", (10, 310), 
+            cv2.putText(img_with_boxes, f"Boxes: {boxes_count}", (10, 280), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, f"Boxes: {boxes_count}", (10, 340), 
+            cv2.putText(img_with_boxes, f"Positive points: {pos_points}", (10, 310), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, f"Positive points: {pos_points}", (10, 370), 
+            cv2.putText(img_with_boxes, f"Negative points: {neg_points}", (10, 340), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, f"Negative points: {neg_points}", (10, 400), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-            # Show object ID summary (for current frame)
-            unique_object_ids = sorted(set(p.object_id for p in current_prompts))
-            if unique_object_ids:
-                obj_summary = "Objects in frame: " + ", ".join(f"ID {obj_id}" for obj_id in unique_object_ids)
-                cv2.putText(img_with_boxes, obj_summary, (10, 430), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 100), 2)
 
             cv2.imshow(window_name, img_with_boxes)
 
@@ -225,30 +430,55 @@ class BoundingBox:
                     cls.prompts.remove(current_prompts[-1])
                     nuke.tprint(f"Undid last selection on frame {cls.current_frame}")
             
-            # Number keys for object ID selection (1-9)
-            elif ord('1') <= key <= ord('9'):
-                # Set the object_id (0-8) - subtract 1 to start from 0
-                new_object_id = key - ord('1')
-                nuke.tprint(f"Set current object ID to {new_object_id}")
-                cls.current_object_id = new_object_id
-            
             elif key == ord('p'):  # Press 'p' to add positive point
                 x, y = mouse_pos['current_pos']
-                prompt = Prompt()
-                prompt.frame_index = cls.current_frame
-                prompt.object_id = cls.current_object_id
-                prompt.points_positive = [[x, y]]
-                cls.prompts.append(prompt)
-                nuke.tprint(f"Added positive point on frame {cls.current_frame} for object {cls.current_object_id}: {x = }, {y = }")
+                # Get current object ID from node
+                try:
+                    current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
+                except:
+                    current_obj_id = 0
+                    
+                # Create new prompt or find existing one
+                prompt = None
+                for p in cls.prompts:
+                    if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
+                        prompt = p
+                        break
+                
+                if prompt is None:
+                    prompt = Prompt()
+                    prompt.frame_index = cls.current_frame
+                    prompt.object_id = current_obj_id
+                    cls.prompts.append(prompt)
+                
+                # Add point to prompt
+                prompt.points_positive.append([x, y])
+                nuke.tprint(f"Added positive point for object {current_obj_id} on frame {cls.current_frame}: {x = }, {y = }")
             
             elif key == ord('n'):  # Press 'n' to add negative point
                 x, y = mouse_pos['current_pos']
-                prompt = Prompt()
-                prompt.frame_index = cls.current_frame
-                prompt.object_id = cls.current_object_id
-                prompt.points_negative = [[x, y]]
-                cls.prompts.append(prompt)
-                nuke.tprint(f"Added negative point on frame {cls.current_frame} for object {cls.current_object_id}: {x = }, {y = }")
+                # Get current object ID from node
+                try:
+                    current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
+                except:
+                    current_obj_id = 0
+                    
+                # Create new prompt or find existing one
+                prompt = None
+                for p in cls.prompts:
+                    if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
+                        prompt = p
+                        break
+                
+                if prompt is None:
+                    prompt = Prompt()
+                    prompt.frame_index = cls.current_frame
+                    prompt.object_id = current_obj_id
+                    cls.prompts.append(prompt)
+                
+                # Add point to prompt
+                prompt.points_negative.append([x, y])
+                nuke.tprint(f"Added negative point for object {current_obj_id} on frame {cls.current_frame}: {x = }, {y = }")
             
             elif key == 83 or key == 100:  # Right arrow key (→)
                 if cls.current_frame < cls.max_frame:
@@ -370,178 +600,6 @@ def UpdatePath():
     FilePath = InputInfos.path
     nuke.thisNode().knob('FilePath').setValue(FilePath)
 
-async def monitor_progress(task_id):
-    """Monitor progress via WebSocket"""
-    uri = f"ws://localhost:8000/api/{API_VERSION}/ws/{task_id}"
-    try:
-        nuke.tprint(f"Connecting to WebSocket at {uri}...")
-        # Set shorter timeouts for connection and operations
-        async with websockets.connect(uri, ping_timeout=20, close_timeout=10) as websocket:
-            nuke.tprint("WebSocket connection established, monitoring progress...")
-            
-            # Keep track of last progress value and message to detect being stuck
-            last_progress = 0
-            last_message = ""
-            stuck_count = 0
-            max_stuck_count = 10  # Exit after being stuck for a while
-            
-            # Add timeout for the entire monitoring process
-            start_time = time.time()
-            max_websocket_time = 300  # 5 minutes maximum
-            
-            # Create a task structure to check for files when progress seems stuck
-            output_dir = f"Output/{task_id}"
-            
-            while True:
-                # Check for timeout
-                if time.time() - start_time > max_websocket_time:
-                    nuke.tprint(f"WebSocket monitoring timed out after {max_websocket_time} seconds")
-                    # Set progress to 100% when timing out - it might have completed but we didn't get the notification
-                    def set_progress_complete():
-                        node = nuke.thisNode()
-                        node.knob('Progress').setValue(100)
-                        if node.knob('StatusLabel'):
-                            node.knob('StatusLabel').setValue("Completed (timeout reached)")
-                    nuke.executeInMainThread(set_progress_complete)
-                    break
-                    
-                try:
-                    # Use timeout to prevent waiting forever
-                    data = await asyncio.wait_for(websocket.recv(), timeout=30)
-                    progress_data = json.loads(data)
-                    
-                    # Update the progress bar
-                    progress = progress_data.get('progress', 0)
-                    message = progress_data.get('message', '')
-                    status = progress_data.get('status', 'running')
-                    
-                    nuke.tprint(f"Progress update: {progress}% - {message} (status: {status})")
-                    
-                    # Update progress knob in main thread
-                    def update_progress_ui(progress_value, message_text):
-                        node = nuke.thisNode()
-                        node.knob('Progress').setValue(progress_value)
-                        # Update status label if it exists
-                        if node.knob('StatusLabel'):
-                            node.knob('StatusLabel').setValue(message_text)
-                    
-                    nuke.executeInMainThread(lambda: update_progress_ui(progress, message))
-                    
-                    # Check if progress is stuck at the same percentage and message
-                    if progress == last_progress and message == last_message:
-                        stuck_count += 1
-                        if stuck_count >= max_stuck_count:
-                            nuke.tprint(f"Progress stuck at {progress}% for {max_stuck_count} updates, checking for output files")
-                            
-                            # Try to check if output files exist already, which would indicate completion
-                            try:
-                                status_url = f"{API_BASE_URL}/api/{API_VERSION}/output/{task_id}"
-                                status_response = requests.get(status_url, timeout=5)
-                                if status_response.status_code == 200:
-                                    output_data = status_response.json()
-                                    files = output_data.get("files", [])
-                                    mask_files = [f for f in files if f["filename"].startswith("mask_")]
-                                    
-                                    # If we have output files but progress is stuck, consider it complete
-                                    if mask_files:
-                                        nuke.tprint(f"Found {len(mask_files)} mask files while progress is stuck. Considering task complete.")
-                                        def set_progress_complete():
-                                            node = nuke.thisNode()
-                                            node.knob('Progress').setValue(100)
-                                            if node.knob('StatusLabel'):
-                                                node.knob('StatusLabel').setValue(f"Completed with {len(mask_files)} frames")
-                                        nuke.executeInMainThread(set_progress_complete)
-                                        break
-                            except Exception as e:
-                                nuke.tprint(f"Error checking for output files: {str(e)}")
-                            
-                            # If we still don't have confirmation of completion, exit monitoring loop
-                            nuke.tprint("Exiting monitoring loop due to stuck progress")
-                            break
-                    else:
-                        stuck_count = 0
-                        last_progress = progress
-                        last_message = message
-                    
-                    # Only display popup for completion or failure, and break out of the monitoring loop
-                    if status in ['completed', 'failed']:
-                        # Always make sure progress is 100% when completed
-                        if status == 'completed' and progress < 100:
-                            def set_progress_complete():
-                                node = nuke.thisNode()
-                                node.knob('Progress').setValue(100)
-                            nuke.executeInMainThread(set_progress_complete)
-                        
-                        if status == 'failed':
-                            error = progress_data.get('error', 'Unknown error')
-                            nuke.tprint(f"Task failed: {error}")
-                            nuke.executeInMainThread(lambda e=error: nuke.message(f"Task failed: {e}"))
-                        break
-                        
-                except asyncio.TimeoutError:
-                    # Timeout waiting for messages, check if connection is still alive
-                    nuke.tprint("Timeout waiting for progress updates, sending ping...")
-                    try:
-                        pong_event = await websocket.ping()
-                        await asyncio.wait_for(pong_event, timeout=5)
-                        nuke.tprint("Server responded to ping, continuing...")
-                    except asyncio.TimeoutError:
-                        nuke.tprint("Server did not respond to ping, checking for output files...")
-                        
-                        # Check if output files exist already, which would indicate completion
-                        try:
-                            status_url = f"{API_BASE_URL}/api/{API_VERSION}/output/{task_id}"
-                            status_response = requests.get(status_url, timeout=5)
-                            if status_response.status_code == 200:
-                                output_data = status_response.json()
-                                files = output_data.get("files", [])
-                                mask_files = [f for f in files if f["filename"].startswith("mask_")]
-                                
-                                # If we have output files but lost connection, consider it complete
-                                if mask_files:
-                                    nuke.tprint(f"Found {len(mask_files)} mask files after connection timeout. Considering task complete.")
-                                    def set_progress_complete():
-                                        node = nuke.thisNode()
-                                        node.knob('Progress').setValue(100)
-                                        if node.knob('StatusLabel'):
-                                            node.knob('StatusLabel').setValue(f"Completed with {len(mask_files)} frames")
-                                    nuke.executeInMainThread(set_progress_complete)
-                            else:
-                                nuke.tprint("No output files found yet, breaking connection")
-                        except Exception as e:
-                            nuke.tprint(f"Error checking for output files: {str(e)}")
-                        
-                        break
-                except Exception as e:
-                    nuke.tprint(f"Error receiving progress update: {str(e)}")
-                    # Try to continue anyway
-                    await asyncio.sleep(2)
-    except Exception as e:
-        nuke.tprint(f"WebSocket connection error: {str(e)}")
-        # If we can't connect to WebSocket, fall back to polling the server for status
-        try:
-            nuke.tprint("Falling back to HTTP polling for progress...")
-            status_url = f"{API_BASE_URL}/api/{API_VERSION}/output/{task_id}"
-            while True:
-                try:
-                    status_response = requests.get(status_url, timeout=5)
-                    if status_response.status_code == 200:
-                        # We have a result, task is likely complete
-                        nuke.executeInMainThread(lambda: nuke.thisNode().knob('Progress').setValue(100))
-                        nuke.tprint("Task completed according to HTTP polling")
-                        break
-                    elif status_response.status_code == 404:
-                        # Task not complete yet
-                        await asyncio.sleep(3)
-                    else:
-                        nuke.tprint(f"Unexpected status code from server: {status_response.status_code}")
-                        break
-                except Exception as polling_err:
-                    nuke.tprint(f"Error polling status: {polling_err}")
-                    break
-        except Exception as fallback_err:
-            nuke.tprint(f"Error in fallback polling: {fallback_err}")
-
 def check_api_server():
     """Check if the API server is running and accessible"""
     try:
@@ -550,82 +608,120 @@ def check_api_server():
     except requests.exceptions.ConnectionError:
         return False
 
+def upgrade_node_if_needed():
+    """Add any missing knobs to existing nodes created with older versions"""
+    try:
+        node = nuke.thisNode()
+        if node is None:
+            nuke.tprint("Warning: thisNode() returned None, unable to upgrade node")
+            return False
+        
+        # Track if we made any changes
+        updated = False
+        
+        # Check if StatusMessage knob exists
+        if not node.knob('StatusMessage'):
+            nuke.tprint("Upgrading SAM2 node with new status message display")
+            status_knob = nuke.Text_Knob('StatusMessage', 'Status')
+            node.addKnob(status_knob)
+            status_knob.setEnabled(False)
+            status_knob.setValue("Idle - Ready to process")
+            status_knob.setTooltip("Current processing status")
+            updated = True
+            
+            # Position the knob after the Progress knob
+            try:
+                # Get the index of the Progress knob
+                progress_index = node.knobs().keys().index('Progress')
+                # Move the new knob to right after Progress
+                for i in range(len(node.knobs()) - progress_index - 2):
+                    status_knob.setFlag(nuke.INVISIBLE)
+                    status_knob.clearFlag(nuke.INVISIBLE)
+            except:
+                nuke.tprint("Warning: Could not reposition StatusMessage knob")
+        
+        return updated
+    except Exception as e:
+        nuke.tprint(f"Error upgrading node: {str(e)}")
+        return False
+
+def normalize_path(path):
+    """Normalize path separators to forward slashes for Nuke compatibility."""
+    # Replace backslashes with forward slashes
+    normalized = path.replace('\\', '/')
+    # Remove any double slashes
+    while '//' in normalized:
+        normalized = normalized.replace('//', '/')
+    return normalized
+
 def GenerateMask():
+    # Upgrade the node if needed (for backwards compatibility)
+    upgrade_node_if_needed()
+    
     Output_path = nuke.thisNode().knob('OutputPath').getValue()
 
     # Checks
     if str(os.path.splitext(os.path.basename(Output_path))[0]) == '':
-        raise TypeError("You must assign a file name")
+        nuke.message("You must assign a file name")
+        return
         
     if nuke.thisNode()['FilePath'].value().lower().endswith("mp4"):
-        raise TypeError('Unsupported input format. Input must be an Image Sequence')
+        nuke.message('Unsupported input format. Input must be an Image Sequence')
+        return
         
     if nuke.thisNode().knob('FileType').value() == "exr":
         if ("%04d" not in Output_path) and ("%03d" not in Output_path):
-            raise TypeError("Your file must contains '####' or '###'")
+            nuke.message("Your file must contains '####' or '###'")
+            return
 
     if not BoundingBox.prompts:
-        raise TypeError("No prompts added. Please add at least one bounding box or points.")
+        nuke.message("No prompts added. Please add at least one bounding box or points.")
+        return
 
     # Check if API server is running
     if not check_api_server():
         nuke.message("Error: API server is not running. Please ensure the server is running at " + API_BASE_URL)
         return
 
+    # Reset progress bar and status message
+    update_status_safely("Starting processing...")
+    
+    # Get all required parameters
     video_path = nuke.thisNode().knob('FilePath').value()
     video_output_path = nuke.thisNode().knob('OutputPath').getValue()
     save_to_file = nuke.thisNode().knob('FileType').value()
-    
-    # Get frame range from UI (Nuke uses 1-based frame numbers)
-    ui_frame_min = int(nuke.thisNode().knob('FrameRangeMin').value())
-    ui_frame_max = int(nuke.thisNode().knob('FrameRangeMax').value())
-    
-    # Create frame range for API (server uses 0-based indexing)
-    # Adjust frame range for server's 0-based indexing
-    frame_range = [ui_frame_min - 1, ui_frame_max]  # Convert to 0-based for server, keep max inclusive
-    
+    frame_range = [int(nuke.thisNode().knob('FrameRangeMin').value()),
+                  int(nuke.thisNode().knob('FrameRangeMax').value() + 1)]
     original_fps = int(InputInfos.original_fps)
     target_fps = int(nuke.thisNode().knob('FPS').value())
     bits = InputInfos.bits
     model_type = nuke.thisNode().knob('ModelType').value().lower()
 
-    # First, ensure the correct model is loaded
-    try:
-        nuke.tprint("Attempting to load model...")
+    # Create a threaded task for loading the model
+    def load_model():
+        nuke.tprint("Loading model in background...")
         response = requests.post(
             f"{API_BASE_URL}/api/{API_VERSION}/models/load",
             json={"model_type": model_type},
-            timeout=30  # Add timeout
+            timeout=30
         )
         response.raise_for_status()
-        nuke.tprint("Model loaded successfully")
-    except requests.exceptions.ConnectionError:
-        nuke.message(f"Failed to connect to API server at {API_BASE_URL}. Please ensure the server is running.")
-        return
-    except requests.exceptions.Timeout:
-        nuke.message("Request timed out while loading model. Please try again.")
-        return
-    except Exception as e:
-        nuke.message(f"Failed to load model: {str(e)}")
-        return
-
-    # Update status to indicate processing is starting
-    nuke.thisNode().knob('StatusLabel').setValue("Starting processing...")
-    nuke.thisNode().knob('Progress').setValue(0)
-
-    # Process the sequence
-    try:
-        nuke.tprint("Preparing to process sequence...")
-        
+        return model_type
+    
+    def on_model_loaded(model_type):
+        nuke.tprint(f"Model {model_type} loaded successfully, starting processing...")
+        # Start the sequence processing
+        process_task.run_in_background(process_sequence)
+    
+    def on_model_error(error):
+        nuke.message(f"Failed to load model: {error}")
+    
+    # Function to process the sequence after model is loaded
+    def process_sequence():
         # Validate all prompts to ensure correct data types
         validated_prompts = []
         for prompt in BoundingBox.prompts:
-            # Adjust frame_index to be 0-based for the server
-            # The prompt.frame_index is UI-based (1-indexed)
-            prompt_dict = prompt.validate_data_types().__dict__
-            # Convert frame index to 0-based for server
-            prompt_dict["frame_index"] = prompt_dict["frame_index"] - ui_frame_min
-            validated_prompts.append(prompt_dict)
+            validated_prompts.append(prompt.validate_data_types().__dict__)
         
         request_data = {
             "sequence_path": video_path,
@@ -633,540 +729,326 @@ def GenerateMask():
             "prompts": validated_prompts,
             "bits": bits,
             "original_fps": original_fps,
-            "target_fps": target_fps
+            "target_fps": target_fps,
+            "reverse": False  # Always set to False since we removed the UI option
         }
 
         nuke.tprint("Sending sequence to API for processing...")
-        nuke.tprint(f"Request data: {json.dumps(request_data, indent=2)}")
         
-        # Increase timeout to 300 seconds (5 minutes) for processing large sequences
-        # The server needs time to process frames, especially for longer sequences
-        try:
-            nuke.tprint("Making API request with extended timeout (5 minutes)...")
-            response = requests.post(
-                f"{API_BASE_URL}/api/{API_VERSION}/process_sequence?as_file=true",
-                json=request_data,
-                timeout=300  # Increased timeout to 5 minutes
-            )
-            response.raise_for_status()
+        response = requests.post(
+            f"{API_BASE_URL}/api/{API_VERSION}/process_sequence?as_file=true",
+            json=request_data,
+            timeout=300  # 5 minutes timeout
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        nuke.tprint(f"Received response: {json.dumps(result, indent=2)}")
+        
+        # If we get a task_id, start monitoring progress
+        if "task_id" in result:
+            task_id = result["task_id"]
+            nuke.tprint(f"Processing started with task ID: {task_id}")
+            process_task.start_progress_monitor(task_id)
             
-            result = response.json()
-            nuke.tprint(f"Received response: {json.dumps(result, indent=2)}")
+            # Poll for completion and download results
+            output_endpoint = f"{API_BASE_URL}/api/{API_VERSION}/output/{task_id}"
+            max_attempts = 60  # 5 minutes at 5-second intervals
+            attempt = 0
             
-            # Check for valid output
-            if "result" in result:
-                nuke.tprint("Processing completed successfully")
-                
-                # Handle different response formats
-                if save_to_file:
-                    # Check if we have direct access to the output files
-                    if "output_dir" in result and "zip_path" in result:
-                        output_dir = result["output_dir"]
-                        zip_path = result["zip_path"]
-                        file_count = result.get("file_count", 0)
+            while attempt < max_attempts and process_task.running:
+                attempt += 1
+                try:
+                    output_response = requests.get(output_endpoint, timeout=5)
+                    if output_response.status_code == 200:
+                        output_data = output_response.json()
                         
-                        nuke.tprint(f"Server saved {file_count} files to {output_dir}")
-                        nuke.tprint(f"ZIP file available at {zip_path}")
-                        
-                        # Try to download the result
-                        try:
-                            # Create output directory if needed
-                            output_folder = os.path.dirname(video_output_path)
-                            if output_folder and not os.path.exists(output_folder):
-                                os.makedirs(output_folder, exist_ok=True)
+                        # Find the ZIP file
+                        zip_file = None
+                        for file_info in output_data.get("files", []):
+                            if file_info["filename"].endswith(".zip"):
+                                zip_file = file_info
+                                break
+                                
+                        if zip_file:
+                            # Found ZIP file, download it
+                            download_url = f"{API_BASE_URL}/api/{API_VERSION}/download/{zip_file['filename']}"
+                            nuke.executeInMainThread(lambda: update_status_safely("Preparing to download result files..."))
                             
-                            # Use the download endpoint regardless of local file existence
-                            # This is more reliable with WSL/Windows interaction
-                            nuke.tprint("Downloading result file from server...")
+                            # Get file size if available for progress tracking
+                            file_size = zip_file.get('size', 0)
                             
-                            # Try to download the result
-                            download_url = f"{API_BASE_URL}/api/{API_VERSION}/download/{os.path.basename(zip_path)}"
+                            # Download with progress tracking
+                            nuke.executeInMainThread(lambda: update_status_safely("Downloading result files..."))
+                            download_response = requests.get(download_url, stream=True, timeout=60)
+                            download_response.raise_for_status()
                             
-                            # Try regular download first
-                            download_response = requests.get(download_url, stream=True)
-                            if download_response.status_code != 200:
-                                # If that fails, try the bulk download
-                                nuke.tprint("Direct file download failed, trying bulk download...")
-                                try:
-                                    download_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
-                                    download_response = requests.get(download_url, stream=True)
-                                except NameError:
-                                    # task_id might not be defined yet in this code path
-                                    nuke.tprint("task_id not defined yet, extracting from output_dir in result")
-                                    # Try to extract task_id from output_dir path
-                                    if "output_dir" in result:
-                                        output_dir = result["output_dir"]
-                                        import re
-                                        task_id_match = re.search(r'Output/([^/]+)', output_dir)
-                                        if task_id_match:
-                                            task_id = task_id_match.group(1)
-                                            download_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
-                                            download_response = requests.get(download_url, stream=True)
-                                        else:
-                                            nuke.tprint("Could not extract task_id from output_dir")
-                                            download_response = download_response  # Keep the original response
-                                
-                            if download_response.status_code == 200:
-                                # Continue with downloading and processing as before
-                                # Save to temp file first to prevent incomplete downloads
-                                temp_output_path = video_output_path + ".tmp"
-                                with open(temp_output_path, 'wb') as f:
-                                    for chunk in download_response.iter_content(chunk_size=8192):
-                                        f.write(chunk)
-                                
-                                # Rename temp file to final output
-                                if os.path.exists(video_output_path):
-                                    os.remove(video_output_path)
-                                os.rename(temp_output_path, video_output_path)
-                                
-                                # If it's a ZIP and not the final target format, extract it
-                                if not video_output_path.lower().endswith('.zip') and video_output_path.endswith('.exr'):
-                                    nuke.tprint(f"Extracting masks from {video_output_path} to output location")
-                                    extract_dir = os.path.dirname(video_output_path)
-                                    if not extract_dir:
-                                        extract_dir = '.'
-                                    
-                                    # Create extraction dir if needed
-                                    if extract_dir and not os.path.exists(extract_dir):
-                                        os.makedirs(extract_dir, exist_ok=True)
-                                    
-                                    # Extract zip
-                                    with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
-                                        zip_ref.extractall(extract_dir)
-                                    
-                                    # Clean up zip file after extraction
-                                    os.remove(video_output_path)
-                                    
-                                # Create a read node for the mask files
-                                if video_output_path.endswith('.exr'):
-                                    pattern = video_output_path
-                                else:
-                                    pattern = os.path.join(extract_dir, "mask_%04d.exr")
-                                    
-                                # Create read node with proper frame range
-                                # The mask files from server use 0-based indexing, so they're numbered from 0
-                                # But Nuke expects frames to match the UI range (1-based), so adjust accordingly
-                                read_node = nuke.nodes.Read(file=pattern)
-                                
-                                # Server's files are 0-indexed but Nuke expects frame numbers to match UI
-                                # Set first/last to the UI-based frame range values
-                                read_node['first'].setValue(ui_frame_min)
-                                read_node['last'].setValue(ui_frame_max)
-                                
-                                # But also tell the node which frames actually exist in the file sequence (0-based)
-                                read_node['origfirst'].setValue(0)
-                                read_node['origlast'].setValue(frame_range[1] - frame_range[0])
-                                
-                                # Offset the frames to map from file index to UI frame number
-                                read_node['frame_mode'].setValue('offset')
-                                read_node['frame'].setValue(str(ui_frame_min))
-                                
-                                nuke.message(f"Mask generation completed! Files saved and loaded into Nuke.")
-                            else:
-                                nuke.message(f"Server processing completed but could not download result (HTTP {download_response.status_code}). Files are available on server at {output_dir}")
-                        except Exception as e:
-                            nuke.message(f"Error downloading output files: {str(e)}\nFiles are available on server at {output_dir}")
-                    else:
-                        # Old behavior - binary download
-                        try:
-                            # If the response is a ZIP file, save it directly
+                            # Create output directory
+                            output_dir = os.path.dirname(video_output_path)
+                            if output_dir and not os.path.exists(output_dir):
+                                os.makedirs(output_dir, exist_ok=True)
+                            
+                            # Save to file with progress tracking
+                            total_downloaded = 0
                             with open(video_output_path, 'wb') as f:
-                                f.write(response.content)
-                            nuke.message("Mask generation completed and saved successfully!")
-                            
-                            # Create read node for the output file
-                            read_node = nuke.nodes.Read(file=video_output_path, first=frame_range[0], last=frame_range[1]-1, origfirst=frame_range[0], origlast=frame_range[1]-1)
-                        except Exception as e:
-                            nuke.message(f"Error saving output: {str(e)}")
-                else:
-                    # If we got back JSON data
-                    try:
-                        if "json_path" in result:
-                            # Server saved JSON to file
-                            json_path = result["json_path"]
-                            nuke.tprint(f"Server saved JSON result to {json_path}")
-                            
-                            # Create a file structure for Nuke to read
-                            output_folder = os.path.dirname(video_output_path)
-                            if output_folder and not os.path.exists(output_folder):
-                                os.makedirs(output_folder, exist_ok=True)
-                                
-                            # Save the JSON locally too
-                            json_output_path = os.path.splitext(video_output_path)[0] + ".json"
-                            
-                            # Try to download the result
-                            try:
-                                download_url = f"{API_BASE_URL}/api/{API_VERSION}/download/{os.path.basename(json_path)}"
-                                
-                                # Try regular download first
-                                download_response = requests.get(download_url, stream=True)
-                                if download_response.status_code != 200:
-                                    # If that fails, try the bulk download
-                                    nuke.tprint("Direct file download failed, trying bulk download...")
-                                    try:
-                                        download_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
-                                        download_response = requests.get(download_url, stream=True)
-                                    except NameError:
-                                        # task_id might not be defined yet in this code path
-                                        nuke.tprint("task_id not defined yet, extracting from output_dir in result")
-                                        # Try to extract task_id from output_dir path
-                                        if "output_dir" in result:
-                                            output_dir = result["output_dir"]
-                                            import re
-                                            task_id_match = re.search(r'Output/([^/]+)', output_dir)
-                                            if task_id_match:
-                                                task_id = task_id_match.group(1)
-                                                download_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
-                                                download_response = requests.get(download_url, stream=True)
-                                            else:
-                                                nuke.tprint("Could not extract task_id from output_dir")
-                                                download_response = download_response  # Keep the original response
-                                
-                                if download_response.status_code == 200:
-                                    # Continue with downloading and processing as before
-                                    # Save to temp file first to prevent incomplete downloads
-                                    temp_output_path = json_output_path + ".tmp"
-                                    with open(temp_output_path, 'wb') as f:
-                                        for chunk in download_response.iter_content(chunk_size=8192):
-                                            f.write(chunk)
+                                for i, chunk in enumerate(download_response.iter_content(chunk_size=8192)):
+                                    f.write(chunk)
+                                    total_downloaded += len(chunk)
                                     
-                                    # Rename temp file to final output
-                                    if os.path.exists(json_output_path):
-                                        os.remove(json_output_path)
-                                    os.rename(temp_output_path, json_output_path)
+                                    # Update progress every 20 chunks
+                                    if i % 20 == 0:
+                                        if file_size > 0:
+                                            # Calculate download progress (90-95%)
+                                            download_progress = 90 + (total_downloaded / file_size) * 5
+                                            nuke.executeInMainThread(lambda p=download_progress: update_status_safely(f"Download progress: {int(p)}%"))
+                                        else:
+                                            # If file size unknown, just show intermediate progress
+                                            nuke.executeInMainThread(lambda: update_status_safely("Downloading..."))
+                            
+                            # Always make sure we're at 95% after download
+                            nuke.executeInMainThread(lambda: update_status_safely("Download complete, extracting files..."))
+                            
+                            # Extract if needed
+                            if not video_output_path.lower().endswith('.zip'):
+                                extract_dir = os.path.dirname(video_output_path)
+                                with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
+                                    # Get total number of files for progress tracking
+                                    file_count = len(zip_ref.infolist())
                                     
-                                    # Try to load the JSON to see if it's valid
-                                    try:
-                                        with open(json_output_path, 'r') as f:
-                                            json_data = json.load(f)
-                                        nuke.tprint(f"Downloaded and parsed valid JSON data from server")
-                                    except json.JSONDecodeError:
-                                        # If it's not valid JSON, it might be a binary file
-                                        nuke.tprint("Downloaded file is not valid JSON, might be a binary file")
-                                        # Try to download as all_files ZIP and extract
-                                        try:
-                                            all_files_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
-                                            all_files_response = requests.get(all_files_url, stream=True, timeout=30)
-                                            if all_files_response.status_code == 200:
-                                                extract_dir = os.path.dirname(json_output_path)
-                                                zip_path = extract_dir + "/all_files.zip"
-                                                with open(zip_path, 'wb') as f:
-                                                    for chunk in all_files_response.iter_content(chunk_size=8192):
-                                                        f.write(chunk)
-                                                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                                                    zip_ref.extractall(extract_dir)
-                                                # Look for JSON files in the extracted content
-                                                for file in os.listdir(extract_dir):
-                                                    if file.endswith('.json'):
-                                                        json_output_path = os.path.join(extract_dir, file)
-                                                        break
-                                        except Exception as e:
-                                            nuke.tprint(f"Error trying to get JSON data from all-files ZIP: {str(e)}")
-                                    
-                                    nuke.message(f"Mask generation completed! Data saved to {json_output_path}")
-                            except Exception as e:
-                                # Fall back to using data from the response
-                                masks_data = result.get("result", {})
-                                if masks_data:
-                                    with open(json_output_path, 'w') as f:
-                                        json.dump(masks_data, f)
-                                    nuke.message(f"Mask generation completed! Data saved to {json_output_path}")
+                                    # Extract files with progress tracking
+                                    for i, file in enumerate(zip_ref.infolist()):
+                                        zip_ref.extract(file, extract_dir)
+                                        # Update extraction progress (95-98%)
+                                        if i % max(1, file_count // 10) == 0:  # Update 10 times total
+                                            extraction_progress = 95 + (i / file_count) * 3
+                                            nuke.executeInMainThread(lambda p=extraction_progress: update_status_safely(f"Extraction progress: {int(p)}%"))
+                                        
+                                        # Show filename being extracted every 10 files
+                                        if i % 10 == 0:
+                                            nuke.executeInMainThread(lambda f=file.filename: 
+                                                update_status_safely(f"Extracting: {f}"))
+                                
+                                # Delete the ZIP file
+                                os.remove(video_output_path)
+                                nuke.executeInMainThread(lambda: update_status_safely("Extraction complete"))
+                            
+                            # Always make sure we're at 98% after extraction
+                            nuke.executeInMainThread(lambda: update_status_safely("Setting up read node..."))
+                            
+                            # Create a read node in the main thread
+                            def create_read_node():
+                                if video_output_path.endswith('.zip'):
+                                    normalized_path = normalize_path(video_output_path)
+                                    read_node = nuke.nodes.Read(file=normalized_path, first=frame_range[0], last=frame_range[1]-1)
                                 else:
-                                    nuke.message(f"Error downloading JSON data: {str(e)}\nData is available on server at {json_path}")
-                    except Exception as e:
-                        nuke.message(f"Error saving JSON data: {str(e)}")
-            elif "task_id" in result:
-                nuke.tprint("Processing started, monitoring progress...")
-                # Start progress monitoring in a separate thread
-                task_id = result["task_id"]
-                
-                # Create a thread for monitoring progress
-                def run_progress_monitor():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(monitor_progress(task_id))
-                    loop.close()
-                
-                # Start the progress monitoring in a background thread
-                progress_thread = threading.Thread(target=run_progress_monitor)
-                progress_thread.daemon = True
-                progress_thread.start()
-                
-                # Wait for processing to complete
-                output_endpoint = f"{API_BASE_URL}/api/{API_VERSION}/output/{task_id}"
-                max_attempts = 60  # 5 minutes with 5-second interval
-                attempt = 0
-                success = False
-                
-                # Set a timeout timer
-                start_time = time.time()
-                timeout_seconds = 300  # 5 minutes timeout
-                
-                while attempt < max_attempts:
-                    # Check if we've exceeded the timeout
-                    if time.time() - start_time > timeout_seconds:
-                        nuke.tprint(f"Timeout exceeded ({timeout_seconds} seconds). Giving up on waiting for task.")
-                        nuke.message("Processing timed out. The task might still complete on the server, try downloading the results manually.")
-                        break
-                        
-                    attempt += 1
-                    nuke.tprint(f"Checking task status (attempt {attempt}/{max_attempts})...")
-                    try:
-                        output_response = requests.get(output_endpoint, timeout=10)
-                        if output_response.status_code == 200:
-                            output_data = output_response.json()
-                            nuke.tprint(f"Got task output data: {json.dumps(output_data, indent=2)}")
-                            
-                            # Check if files are complete - if all expected frames exist, we can proceed
-                            # The server frames are zero-indexed, but our frame range is one-indexed
-                            server_frames = output_data.get("frames", [])
-                            expected_frames = list(range(frame_range[0]-1, frame_range[1]-1))  # Adjust for zero-indexing
-                            
-                            # If all frames we expect are in the server frame list, we can consider it complete
-                            all_frames_complete = all(frame in server_frames for frame in expected_frames)
-                            if all_frames_complete:
-                                nuke.tprint(f"All expected frames {expected_frames} are present in server frames {server_frames}")
+                                    # Find mask pattern
+                                    extract_dir = os.path.dirname(video_output_path)
+                                    mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
+                                    # Normalize the path
+                                    normalized_pattern = normalize_path(mask_pattern)
+                                    read_node = nuke.nodes.Read(file=normalized_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
                                 
-                            # Count actual mask files
-                            mask_files = [f for f in output_data.get("files", []) if f["filename"].startswith("mask_")]
-                            nuke.tprint(f"Found {len(mask_files)} mask files out of {len(expected_frames)} expected frames")
-                            
-                            # If file count matches expected frames or we have confirmed all frames are complete, proceed
-                            if len(mask_files) >= len(expected_frames) or all_frames_complete:
-                                nuke.tprint("All frames appear to be processed, proceeding with download regardless of progress status")
-                            
-                            # Find the ZIP file
-                            zip_file = None
-                            for file_info in output_data.get("files", []):
-                                if file_info["filename"].endswith(".zip"):
-                                    zip_file = file_info
-                                    break
-                                    
-                            if zip_file:
-                                # Download the ZIP file
-                                nuke.tprint(f"Found ZIP file: {zip_file['filename']}")
-                                download_url = f"{API_BASE_URL}/api/{API_VERSION}/download/{zip_file['filename']}"
+                                # Mark as 100% complete
+                                update_status_safely("Processing completed successfully")
                                 
-                                try:
-                                    # Download and save the file
-                                    zip_response = requests.get(download_url, stream=True, timeout=30)
-                                    zip_response.raise_for_status()
-                                    
-                                    # Create output directory if needed
-                                    output_dir = os.path.dirname(video_output_path)
-                                    if output_dir and not os.path.exists(output_dir):
-                                        os.makedirs(output_dir, exist_ok=True)
-                                    
-                                    # Save to a temporary file first
-                                    temp_output_path = video_output_path + ".tmp"
-                                    with open(temp_output_path, 'wb') as f:
-                                        for chunk in zip_response.iter_content(chunk_size=8192):
-                                            f.write(chunk)
-                                    
-                                    # Rename to final path
-                                    if os.path.exists(video_output_path):
-                                        os.remove(video_output_path)
-                                    os.rename(temp_output_path, video_output_path)
-                                    
-                                    # Extract the ZIP if needed
-                                    if not video_output_path.lower().endswith('.zip'):
-                                        extract_dir = os.path.dirname(video_output_path)
-                                        if not extract_dir:
-                                            extract_dir = '.'
-                                        
-                                        # Create extraction dir if needed
-                                        if not os.path.exists(extract_dir):
-                                            os.makedirs(extract_dir, exist_ok=True)
-                                        
-                                        # Extract the ZIP file
-                                        with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
-                                            zip_ref.extractall(extract_dir)
-                                        
-                                        # Clean up the ZIP file
-                                        os.remove(video_output_path)
-                                        
-                                        # Load all EXR files - adjust for zero-indexing on server side
-                                        mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
-                                        read_node = nuke.nodes.Read(file=mask_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
-                                    else:
-                                        # Keep the ZIP file
-                                        read_node = nuke.nodes.Read(file=video_output_path, first=frame_range[0]-1, last=frame_range[1]-2)
-                                    
-                                    success = True
-                                    nuke.message(f"Mask generation completed! Files saved and loaded into Nuke.")
-                                    break
-                                    
-                                except Exception as download_err:
-                                    nuke.tprint(f"Error downloading ZIP file: {str(download_err)}")
-                                    # Try falling back to individual files
-                                    try:
-                                        # Try downloading the all-in-one ZIP
-                                        nuke.tprint("Trying to download all files in one batch...")
-                                        all_files_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
-                                        all_files_response = requests.get(all_files_url, stream=True, timeout=30)
-                                        if all_files_response.status_code == 200:
-                                            with open(video_output_path, 'wb') as f:
-                                                for chunk in all_files_response.iter_content(chunk_size=8192):
-                                                    f.write(chunk)
-                                            
-                                            # Extract the ZIP if needed
-                                            extract_dir = os.path.dirname(video_output_path)
-                                            if not extract_dir:
-                                                extract_dir = '.'
-                                            
-                                            # Extract the ZIP
-                                            with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
-                                                zip_ref.extractall(extract_dir)
-                                            
-                                            # Find EXR files - adjust for zero-indexing
-                                            mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
-                                            read_node = nuke.nodes.Read(file=mask_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
-                                            
-                                            success = True
-                                            nuke.message(f"Mask generation completed! Files saved and loaded into Nuke.")
-                                            break
-                                    except Exception as all_files_err:
-                                        nuke.tprint(f"Error downloading all files: {str(all_files_err)}")
-                            else:
-                                # No ZIP file found yet, but files might be there individually
-                                nuke.tprint("No ZIP file found, checking for individual mask files...")
+                                nuke.message("Mask generation completed! Files saved and loaded into Nuke.")
                                 
-                                # Check if all mask files are present
-                                mask_files_present = True
-                                for frame_idx in range(0, frame_range[1]-frame_range[0]):  # Adjust for zero-indexing
-                                    mask_filename = f"mask_{frame_idx:04d}.exr"
-                                    found = False
-                                    for file_info in output_data.get("files", []):
-                                        if file_info["filename"] == mask_filename:
-                                            found = True
-                                            break
-                                    if not found:
-                                        mask_files_present = False
-                                        break
-                                
-                                if mask_files_present:
-                                    # All mask files are present, create a directory and download them
-                                    try:
-                                        extract_dir = os.path.dirname(video_output_path)
-                                        if not extract_dir:
-                                            extract_dir = '.'
-                                        
-                                        if not os.path.exists(extract_dir):
-                                            os.makedirs(extract_dir, exist_ok=True)
-                                        
-                                        # Download each mask file - adjusted for zero-indexing
-                                        for frame_idx in range(0, frame_range[1]-frame_range[0]):
-                                            mask_filename = f"mask_{frame_idx:04d}.exr"
-                                            download_url = f"{API_BASE_URL}/api/{API_VERSION}/download/{mask_filename}"
-                                            mask_response = requests.get(download_url, timeout=10)
-                                            if mask_response.status_code == 200:
-                                                output_file = os.path.join(extract_dir, mask_filename)
-                                                with open(output_file, 'wb') as f:
-                                                    f.write(mask_response.content)
-                                        
-                                        # Create read node
-                                        mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
-                                        read_node = nuke.nodes.Read(file=mask_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
-                                        
-                                        success = True
-                                        nuke.message(f"Mask generation completed! Files saved and loaded into Nuke.")
-                                        break
-                                    except Exception as mask_download_err:
-                                        nuke.tprint(f"Error downloading individual mask files: {str(mask_download_err)}")
-                                        
-                            # If we reach here and haven't broken out of the loop, check if we need to handle a stuck process
-                            # Check if progress is stuck
-                            progress_value = nuke.thisNode().knob('Progress').value()
-                            if attempt > 5 and progress_value >= 80:
-                                # If we've been at 80% or higher for a while and have all expected mask files,
-                                # we can consider processing complete even if the server doesn't send a "completed" status
-                                files = output_data.get("files", [])
-                                mask_files = [f for f in files if f["filename"].startswith("mask_")]
-                                expected_frame_count = frame_range[1] - frame_range[0]
-                                
-                                if len(mask_files) >= expected_frame_count:
-                                    nuke.tprint(f"Progress stuck at {progress_value}%, but found {len(mask_files)} mask files, which meets or exceeds expected {expected_frame_count} frames")
-                                    nuke.tprint("Considering processing complete and breaking out of waiting loop")
-                                    
-                                    # Use the all_files endpoint to get everything at once
-                                    try:
-                                        download_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
-                                        nuke.tprint(f"Downloading all files using: {download_url}")
-                                        all_files_response = requests.get(download_url, stream=True, timeout=60)
-                                        if all_files_response.status_code == 200:
-                                            extract_dir = os.path.dirname(video_output_path)
-                                            if not extract_dir:
-                                                extract_dir = '.'
-                                            
-                                            if not os.path.exists(extract_dir):
-                                                os.makedirs(extract_dir, exist_ok=True)
-                                                
-                                            all_files_zip = os.path.join(extract_dir, "all_files.zip")
-                                            
-                                            # Save the ZIP
-                                            with open(all_files_zip, 'wb') as f:
-                                                for chunk in all_files_response.iter_content(chunk_size=8192):
-                                                    f.write(chunk)
-                                                    
-                                            # Extract it
-                                            with zipfile.ZipFile(all_files_zip, 'r') as zip_ref:
-                                                zip_ref.extractall(extract_dir)
-                                                
-                                            # Create read node with proper indexing
-                                            mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
-                                            read_node = nuke.nodes.Read(file=mask_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
-                                            
-                                            success = True
-                                            nuke.message(f"Mask generation completed! Files saved and loaded into Nuke.")
-                                            break
-                                    except Exception as e:
-                                        nuke.tprint(f"Error when trying to force download files: {str(e)}")
-
-                        elif output_response.status_code == 404:
-                            # Task still processing
-                            nuke.tprint("Task still processing, waiting...")
-                    except Exception as e:
-                        nuke.tprint(f"Error checking task status: {str(e)}")
-                    
-                    # Check if progress is stuck
-                    progress_value = nuke.thisNode().knob('Progress').value()
-                    if attempt > 10 and progress_value < 90:
-                        # Try reading progress directly from server
-                        try:
-                            progress_url = f"{API_BASE_URL}/api/{API_VERSION}/status/{task_id}"
-                            progress_response = requests.get(progress_url, timeout=5)
-                            if progress_response.status_code == 200:
-                                progress_data = progress_response.json()
-                                status = progress_data.get('status', '')
-                                if status == 'completed':
-                                    # Force another attempt to get output
-                                    nuke.tprint("Server indicates task is complete, trying to get output...")
-                                    continue
-                        except Exception:
-                            pass
-                    
-                    # Wait before next attempt
+                            nuke.executeInMainThread(create_read_node)
+                            return
+                        else:
+                            # No ZIP file yet, keep waiting
+                            time.sleep(5)
+                    else:
+                        # Task not ready yet
+                        time.sleep(5)
+                except Exception as e:
+                    nuke.tprint(f"Error checking task output: {str(e)}")
                     time.sleep(5)
+            
+            # If we get here, we haven't found a ZIP file yet
+            # Try the download_all endpoint as a last resort
+            try:
+                download_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
+                nuke.executeInMainThread(lambda: update_status_safely("Trying direct download of all result files..."))
                 
-                if not success:
-                    nuke.message("Timed out waiting for mask generation to complete. Please check the server logs.")
-            else:
-                nuke.message("Failed to get result data from server response.")
-        except requests.exceptions.Timeout:
-            nuke.message("Request timed out after 5 minutes. The sequence may be too large or complex to process in that time. Try reducing the frame range or using a different model type.")
-        except requests.exceptions.ConnectionError as e:
-            nuke.message(f"Connection error to API server: {str(e)}\n\nPlease check if the server is running.")
-        except requests.exceptions.HTTPError as e:
-            nuke.message(f"HTTP error when contacting API server: {str(e)}\n\nPlease check the server logs for details.")
-        except Exception as e:
-            nuke.message(f"Unexpected error during mask generation: {str(e)}")
+                download_response = requests.get(download_url, stream=True, timeout=60)
+                
+                if download_response.status_code == 200:
+                    # Create output directory
+                    output_dir = os.path.dirname(video_output_path)
+                    if output_dir and not os.path.exists(output_dir):
+                        os.makedirs(output_dir, exist_ok=True)
+                    
+                    # Save all files as ZIP with progress tracking
+                    total_size = int(download_response.headers.get('content-length', 0))
+                    total_downloaded = 0
+                    
+                    with open(video_output_path, 'wb') as f:
+                        for i, chunk in enumerate(download_response.iter_content(chunk_size=8192)):
+                            f.write(chunk)
+                            total_downloaded += len(chunk)
+                            
+                            # Update progress every 20 chunks
+                            if i % 20 == 0:
+                                if total_size > 0:
+                                    # Calculate download progress (90-95%)
+                                    download_progress = 90 + (total_downloaded / total_size) * 5
+                                    nuke.executeInMainThread(lambda p=download_progress: update_status_safely(f"Download progress: {int(p)}%"))
+                            else:
+                                    # If file size unknown, just show intermediate progress
+                                    nuke.executeInMainThread(lambda: update_status_safely("Downloading..."))
+                    
+                    nuke.executeInMainThread(lambda: update_status_safely("Direct download complete, extracting files..."))
+                    
+                    # Extract if needed
+                    if not video_output_path.lower().endswith('.zip'):
+                        extract_dir = os.path.dirname(video_output_path)
+                        with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
+                            # Get total number of files for progress tracking
+                            file_count = len(zip_ref.infolist())
+                            
+                            # Extract files with progress tracking
+                            for i, file in enumerate(zip_ref.infolist()):
+                                zip_ref.extract(file, extract_dir)
+                                # Update extraction progress (95-98%)
+                                if i % max(1, file_count // 10) == 0:  # Update 10 times total
+                                    extraction_progress = 95 + (i / file_count) * 3
+                                    nuke.executeInMainThread(lambda p=extraction_progress: update_status_safely(f"Extraction progress: {int(p)}%"))
+                                
+                                # Show filename being extracted every 10 files
+                                if i % 10 == 0:
+                                    nuke.executeInMainThread(lambda f=file.filename: 
+                                        update_status_safely(f"Extracting: {f}"))
+                        
+                        # Delete the ZIP file
+                        os.remove(video_output_path)
+                    
+                    nuke.executeInMainThread(lambda: update_status_safely("Finalizing..."))
+                    
+                    # Create read node
+                    def create_read_node():
+                        if video_output_path.endswith('.zip'):
+                            normalized_path = normalize_path(video_output_path)
+                            read_node = nuke.nodes.Read(file=normalized_path, first=frame_range[0], last=frame_range[1]-1)
+                        else:
+                            # Find mask pattern
+                            extract_dir = os.path.dirname(video_output_path)
+                            mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
+                            # Normalize the path
+                            normalized_pattern = normalize_path(mask_pattern)
+                            read_node = nuke.nodes.Read(file=normalized_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
+                        nuke.message("Mask generation completed! Files saved and loaded into Nuke.")
+                    
+                    nuke.executeInMainThread(create_read_node)
+            except Exception as e:
+                nuke.tprint(f"Error downloading all files: {str(e)}")
+                nuke.executeInMainThread(lambda e=e: nuke.message(f"Error downloading result: {str(e)}"))
+                # Mark error and set the error flag
+                process_task.report_error(f"Error downloading result: {str(e)}")
+        
+        # If we get here with a result but no task_id, it's an immediate result
+        elif "result" in result:
+            nuke.tprint("Processing completed successfully with immediate result")
+            
+            # Handle different response formats
+            if save_to_file and "output_dir" in result and "zip_path" in result:
+                # Server saved files, download the ZIP
+                zip_path = result["zip_path"]
+                try:
+                    download_url = f"{API_BASE_URL}/api/{API_VERSION}/download/{os.path.basename(zip_path)}"
+                    download_response = requests.get(download_url, stream=True)
+                    
+                    # Create output directory
+                    output_dir = os.path.dirname(video_output_path)
+                    if output_dir and not os.path.exists(output_dir):
+                        os.makedirs(output_dir, exist_ok=True)
+                    
+                    # Save to file
+                    with open(video_output_path, 'wb') as f:
+                        for chunk in download_response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    
+                    # Extract if needed
+                    if not video_output_path.lower().endswith('.zip'):
+                        extract_dir = os.path.dirname(video_output_path)
+                        with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
+                            zip_ref.extractall(extract_dir)
+                        
+                        # Delete the ZIP file
+                        os.remove(video_output_path)
+                    
+                    # Create read node in main thread
+                    def create_read_node():
+                        if video_output_path.endswith('.zip'):
+                            normalized_path = normalize_path(video_output_path)
+                            read_node = nuke.nodes.Read(file=normalized_path, first=frame_range[0], last=frame_range[1]-1)
+                        else:
+                            # Find mask pattern
+                            extract_dir = os.path.dirname(video_output_path)
+                            mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
+                            # Normalize the path
+                            normalized_pattern = normalize_path(mask_pattern)
+                            read_node = nuke.nodes.Read(file=normalized_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
+                        nuke.message("Mask generation completed! Files saved and loaded into Nuke.")
+                    
+                    nuke.executeInMainThread(create_read_node)
+                except Exception as e:
+                    nuke.tprint(f"Error downloading result: {str(e)}")
+                    nuke.executeInMainThread(lambda: nuke.message(f"Error downloading result: {str(e)}"))
+    
+    # Function to handle processing errors
+    def on_process_error(error):
+        nuke.message(f"Error during processing: {error}")
+    
+    # Create the threaded task for sequence processing
+    process_task = ThreadedTask(
+        on_progress=lambda p, m: update_status_safely(f"Progress: {int(p)}% - {m}"),
+        on_error=on_process_error
+    )
+    
+    # Create the threaded task for model loading
+    model_task = ThreadedTask(
+        on_complete=on_model_loaded,
+        on_error=on_model_error
+    )
+    
+    # Start loading the model in background
+    model_task.run_in_background(load_model)
+    
+    nuke.tprint("Started background processing. Nuke will remain responsive.")
+
+def reset_model_state():
+    """Reset the model state on the server and clear UI state."""
+    try:
+        # Update status
+        update_status_safely("Resetting model state...")
+        
+        # Make API call to reset endpoint
+        response = requests.post(f"{API_BASE_URL}/api/{API_VERSION}/reset")
+        response.raise_for_status()  # Raise exception for non-200 status codes
+        
+        # Reset local UI state
+        update_status_safely("Model state reset successfully")
+        BoundingBox.clearPrompts()
+        
+        # Reset object ID to 0
+        try:
+            node = nuke.thisNode()
+            if node:
+                node.knob('CurrentObjectID').setValue(0)
+        except:
+            pass
+            
+        nuke.message("Model state reset successfully")
             
     except requests.exceptions.ConnectionError:
-        nuke.message(f"Lost connection to API server at {API_BASE_URL}. Please ensure the server is running.")
-    except requests.exceptions.Timeout:
-        nuke.message("Request timed out. Please try again with a smaller frame range or a faster model (like 'tiny').")
+        error_msg = "Failed to connect to API server. Please ensure the server is running."
+        nuke.message(error_msg)
+        update_status_safely(f"Error: {error_msg}")
     except Exception as e:
-        nuke.message(f"Error during mask generation: {str(e)}")
+        error_msg = f"Failed to reset model state: {str(e)}"
+        nuke.message(error_msg)
+        update_status_safely(f"Error: {error_msg}")
 
 def CreateSAM2Node():
     # Creating node
@@ -1175,12 +1057,6 @@ def CreateSAM2Node():
 
     # Adding knobs
     s.knob('name').setValue('SAM2')
-    
-    # Single tab with all controls
-    s.addKnob(nuke.Tab_Knob('settings_tab', 'SAM2'))
-    
-    # Input section
-    s.addKnob(nuke.Text_Knob('input_section', 'Input'))
     s.addKnob(nuke.File_Knob('FilePath', 'File Path'))
     s.addKnob(nuke.PyScript_Knob('UpdatePath', 'Update Path', 'UpdatePath()'))
     
@@ -1188,50 +1064,92 @@ def CreateSAM2Node():
     s.addKnob(nuke.Int_Knob("FrameRangeMin", 'Frame Range'))
     s.addKnob(nuke.Int_Knob("FrameRangeMax", ' '))
     s.addKnob(nuke.Int_Knob("FPS", 'Output Frame Rate'))
-    s.addKnob(nuke.Enumeration_Knob('ModelType', 'Model type', ['Base+', 'Large', 'Small', 'Tiny']))
+    
+    # Model selection - fixed model types
+    s.addKnob(nuke.Enumeration_Knob('ModelType', 'Model type', ['base', 'large', 'small', 'tiny']))
+    
+    # Object Selection - improved with dropdown
+    s.addKnob(nuke.Double_Knob('CurrentObjectID', 'Object ID'))
+    s.knob('CurrentObjectID').setRange(0, 10)  # Allow up to 10 objects
+    s.knob('CurrentObjectID').setValue(0)
+    s.knob('CurrentObjectID').setTooltip("ID of the object to add selections to (0-10)")
+    
+    # Status Message
+    status_knob = nuke.Text_Knob('StatusMessage', 'Status')
+    status_knob.setEnabled(False)
+    status_knob.setValue("Idle - Ready to process")
+    s.addKnob(status_knob)
+    
+    # Add divider
+    s.addKnob(nuke.Text_Knob('', ''))
     
     # Selection controls
-    s.addKnob(nuke.Text_Knob('selection_section', 'Selection'))
     s.addKnob(nuke.PyScript_Knob('CreateBoundingBox', 'Create Selection', 'BoundingBox.getBbox()'))
     s.addKnob(nuke.PyScript_Knob('ClearPrompts', 'Clear All Selections', 'BoundingBox.clearPrompts()'))
     s.addKnob(nuke.Text_Knob('PromptsList', 'Prompts List'))
     s.knob('PromptsList').setEnabled(False)
+
+    # Add divider
+    s.addKnob(nuke.Text_Knob('', ''))
     
     # Output controls
-    s.addKnob(nuke.Text_Knob('output_section', 'Output'))
     s.addKnob(nuke.Enumeration_Knob('FileType', 'File type', ['exr', 'mp4']))
     s.addKnob(nuke.File_Knob('OutputPath', 'Output Path'))
     s.addKnob(nuke.PyScript_Knob('GenerateMask', 'Generate Mask', 'GenerateMask()'))
     
-    # Progress indicators
-    s.addKnob(nuke.Text_Knob('progress_section', 'Progress'))
-    s.addKnob(nuke.Double_Knob('Progress', 'Processing Progress'))
-    s.knob('Progress').setRange(0, 100)
-    s.knob('Progress').setValue(0)
-    s.knob('Progress').setEnabled(False)
-    s.addKnob(nuke.Text_Knob('StatusLabel', 'Status', 'Idle'))
+    # Add divider
+    s.addKnob(nuke.Text_Knob('', ''))
     
-    # Setting ranges, default values, tooltips & format
+    # Reset Model State
+    s.addKnob(nuke.PyScript_Knob('ResetState', 'Reset Model State', 'reset_model_state()'))
+    
+    # Setting default values and tooltips
     s['FPS'].setValue(int(nuke.root().knob('fps').getValue()))
     s['FrameRangeMin'].setValue(int(nuke.Root()['first_frame'].value()))
     s['FrameRangeMax'].setValue(int(nuke.Root()['last_frame'].value()))
-    s['Progress'].setValue(0)
+    s['StatusMessage'].setValue("Idle - Ready to process")
 
     s['FPS'].setFlag(nuke.STARTLINE)
     s['FrameRangeMax'].clearFlag(nuke.STARTLINE)
     s['UpdatePath'].setFlag(nuke.STARTLINE)
     s['GenerateMask'].setFlag(nuke.STARTLINE)
+    s['ResetState'].setFlag(nuke.STARTLINE)
     
-    # Section dividers should be startline
-    s['input_section'].setFlag(nuke.STARTLINE)
-    s['selection_section'].setFlag(nuke.STARTLINE)
-    s['output_section'].setFlag(nuke.STARTLINE)
-    s['progress_section'].setFlag(nuke.STARTLINE)
-    
-    s['CreateBoundingBox'].setTooltip("Create selection. Use mouse to draw boxes, 'p' for positive point, 'n' for negative point, 1-9 keys to set object ID, arrows to change frame.")
+    s['CreateBoundingBox'].setTooltip("Create selection. Use mouse to draw boxes, 'p' for positive points, 'n' for negative points, arrows to change frame.")
     s['ClearPrompts'].setTooltip("Clear all selections")
+    s['ResetState'].setTooltip("Reset model state and clear GPU memory")
     s['FPS'].setTooltip("Target FPS for the output video")
-    s['ModelType'].setTooltip("Choose your model type")
+    s['ModelType'].setTooltip("Choose your model type: base, large, small, or tiny")
     s['OutputPath'].setTooltip("path/to/your/file_####.exr, to create an image sequence add #### or ###")
     s['GenerateMask'].setTooltip("Generate Mask")
-    s['Progress'].setTooltip("Processing progress") 
+    s['StatusMessage'].setTooltip("Current processing status")
+
+def update_status_safely(message):
+    """Safely update status message, handling cases where knob might be missing"""
+    try:
+        node = nuke.thisNode()
+        if node is None:
+            nuke.tprint(f"Status update: {message}")
+            return False
+        
+        status_knob = node.knob('StatusMessage')
+        if status_knob is None:
+            nuke.tprint(f"Status update: {message}")
+            return False
+        
+        status_knob.setValue(str(message))
+        return True
+    except Exception as e:
+        nuke.tprint(f"Status update: {message}")
+        return False
+
+def reset_ui_state():
+    """Reset the UI state (progress bar and status message)"""
+    update_status_safely("Idle - Ready to process")
+    nuke.tprint("Reset UI state")
+
+async def monitor_progress(task_id):
+    """This function is kept for backward compatibility but is no longer used.
+       Progress monitoring is now handled by the ThreadedTask class."""
+    nuke.tprint("Warning: Deprecated monitor_progress function called. Please update your code to use ThreadedTask.")
+    pass 
