@@ -1,136 +1,155 @@
-# NukeSamurai API
+# NukeSamurai Backend
 
-A FastAPI backend for processing EXR images and sequences with SAM2 segmentation models.
+Backend server for the NukeSamurai plugin, providing SAM2 (Segment Anything Model 2) functionality through a REST API.
 
-## Features
+## Prerequisites
 
-- Process single EXR files with bounding box and point prompts
-- Process EXR sequences with multi-object, multi-frame tracking
-- Support for reverse tracking
-- GPU acceleration with fallback to CPU
-- Docker support for easy deployment
+- Python 3.8 or higher
+- CUDA-capable GPU (recommended)
+- Git
+- pip 20.0 or higher (for dependency management)
 
-## Setup Options
+## Installation
 
-### Option 1: Docker (Recommended)
-
-The easiest way to get started is with Docker:
-
+1. Clone the repository with submodules:
 ```bash
-# Clone the repository (if you haven't already)
-git clone --recursive https://your-repository-url.git
-cd Docker_plugin
-
-# Build and run with Docker Compose (GPU mode)
-docker-compose up -d
-
-# For CPU-only mode (no GPU)
-docker-compose --profile cpu up -d nuke-samurai-api-cpu
+git clone --recursive https://github.com/your-repo/NPP.git
+cd NPP/Docker_plugin
 ```
 
-Note: The `--recursive` flag ensures that the NukeSamurai submodule is also cloned. If you've already cloned without this flag, run:
-
+2. Create and activate a virtual environment:
 ```bash
-git submodule update --init --recursive
+# On Linux/Mac:
+python -m venv .venv
+source .venv/bin/activate
+
+# On Windows:
+python -m venv .venv
+.venv\Scripts\activate
 ```
 
-### Option 2: Local Installation
-
-For local development:
-
+3. Upgrade pip and install build tools:
 ```bash
-# Clone the repository with submodules
-git clone --recursive https://your-repository-url.git
-cd Docker_plugin
+python -m pip install --upgrade pip
+python -m pip install --upgrade setuptools wheel
+```
 
-# Create and activate a virtual environment (optional but recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install the package and dependencies
+4. Install the package in development mode:
+```bash
 pip install -e .
-
-# Download SAM2 model checkpoints
-cd NukeSamurai/sam2_repo/checkpoints
-chmod +x download_ckpts.sh
-./download_ckpts.sh
-cd ../../../../
-
-# Run the server
-nuke-samurai-server --reload
 ```
 
-## Usage
+Note: Do NOT run `python setup.py` directly. Always use `pip install -e .` as it:
+- Properly handles dependency resolution
+- Installs required build tools
+- Sets up the package in development mode
+- Runs all necessary installation steps in the correct order
 
-Once the server is running, you can access the API at http://localhost:8000/api/v1/
+The installation will:
+- Check Python version compatibility
+- Install all required dependencies
+- Set up the SAM2 repository
+- Create default configuration files
+- Set up command-line tools
 
-### API Endpoints
-
-See the [API Reference](../Wikis/backend_api_reference.md) for detailed documentation of all endpoints.
-
-### Example Curl Commands
-
-Process a single EXR file with a bounding box:
-
+5. Verify the installation:
 ```bash
-curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "image_path": "/data/frame_0001.exr",
-    "bbox": [454, 185, 500, 633],
-    "bits": "32-bit float"
-  }' \
-  --output mask.exr
+# Check if the command-line tools are installed
+nuke-samurai-server --version
+
+# Check if SAM2 is properly installed
+python -c "from sam2.utils.transforms import ResizeLongestSide; print('SAM2 installed successfully')"
 ```
 
-Process a sequence with reverse tracking:
+## Configuration
 
+The default configuration is created in `configs/config.yaml`. You can modify it to change:
+- API host and port
+- Log level
+- Output directory
+- CUDA device
+- Batch size
+
+Example configuration:
+```yaml
+api_host: "0.0.0.0"
+api_port: 8000
+log_level: "INFO"
+output_dir: "Output"
+max_batch_size: 32
+cuda_device: 0  # Set to -1 for CPU
+```
+
+## Running the Server
+
+1. Start the API server:
 ```bash
-curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sequence_path": "/data/frame_%04d.exr",
-    "frame_range": [1, 20],
-    "reverse": true,
-    "prompts": [
-      { "frame_index": 15, "bbox": [454, 185, 500, 633] }
-    ],
-    "bits": "32-bit float"
-  }' \
-  --output masks.zip
+nuke-samurai-server
 ```
 
-## Running Tests
+2. The server will be available at `http://localhost:8000`
 
+3. Check the API is running:
 ```bash
-# Run all tests
-nuke-samurai-test --all
-
-# Run only API tests
-nuke-samurai-test --api-tests
-
-# Run only unit tests
-nuke-samurai-test --unit-tests
+curl http://localhost:8000/api/v1/health
 ```
 
-## Environment Variables
+## Development
 
-When using Docker, you can customize the deployment with these environment variables:
-
-- `EXR_DATA_PATH`: Path to your EXR files (default: ./Test_files)
-- `OUTPUT_PATH`: Path for output files (default: ./Output)
-- `CHECKPOINTS_PATH`: Path for model checkpoints (default: ./checkpoints)
-- `CUDA_VISIBLE_DEVICES`: GPU device ID to use (default: 0, set to empty for CPU)
-- `DEBUG`: Enable debug logging (default: false)
-- `SAM2_BUILD_CUDA`: Enable CUDA builds (default: 1, set to 0 for CPU-only)
-- `OPENCV_IO_ENABLE_OPENEXR`: Enable OpenEXR support in OpenCV (default: 1)
-
-Example:
-
+1. Run tests:
 ```bash
-EXR_DATA_PATH=/path/to/exr/files OUTPUT_PATH=/path/to/output docker-compose up -d
+nuke-samurai-test
 ```
+
+2. Format code:
+```bash
+black src/
+isort src/
+```
+
+## Troubleshooting
+
+1. If you get CUDA errors:
+   - Check your CUDA installation
+   - Try setting `cuda_device: -1` in config.yaml to use CPU
+   - Verify PyTorch is installed with CUDA support: `python -c "import torch; print(torch.cuda.is_available())"`
+
+2. If SAM2 installation fails:
+   - Check the SAM2 submodule is properly cloned:
+     ```bash
+     git submodule update --init --recursive
+     ```
+   - Try installing manually:
+     ```bash
+     cd NukeSamurai/sam2_repo
+     pip install -e .
+     pip install -e .[notebooks]
+     ```
+   - Check for compiler errors in the logs
+
+3. If the server won't start:
+   - Check the port is not in use: `netstat -ano | findstr :8000` (Windows) or `lsof -i :8000` (Linux)
+   - Check the logs in `logs/` directory
+   - Verify all dependencies are installed: `pip freeze`
+   - Try running with debug logging: `nuke-samurai-server --log-level debug`
+
+4. Common Installation Issues:
+   - If you get "command not found" errors, make sure your virtual environment is activated
+   - If you get build errors, install required system packages:
+     ```bash
+     # Ubuntu/Debian:
+     sudo apt-get update
+     sudo apt-get install python3-dev build-essential
+
+     # CentOS/RHEL:
+     sudo yum groupinstall "Development Tools"
+     sudo yum install python3-devel
+     ```
+
+## API Documentation
+
+See [API.md](../Wikis/API.md) for detailed API documentation.
 
 ## License
 
-[MIT License](LICENSE) 
+MIT License - see LICENSE file for details 
