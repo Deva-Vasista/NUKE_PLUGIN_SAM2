@@ -1,7 +1,14 @@
-# Use CUDA-enabled Python base image for GPU support
+# ---- Builder stage (for pip cache, optional) ----
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime AS builder
+
+WORKDIR /app
+
+COPY requirements.txt setup.py ./
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+# ---- Final stage ----
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,68 +17,33 @@ ENV PYTHONPATH=/app:/app/NukeSamurai/sam2_repo
 ENV HYDRA_FULL_ERROR=1
 ENV OPENCV_IO_ENABLE_OPENEXR=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libgl1 \
-    libglib2.0-0 \
-    ffmpeg \
-    git \
-    wget \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set workdir
 WORKDIR /app
 
-# Clone the NukeSamurai repository if it's a submodule
-# This is needed because Docker doesn't automatically include git submodules
-RUN mkdir -p NukeSamurai
-RUN if [ ! -d "NukeSamurai/sam2_repo" ]; then \
-    git clone https://github.com/facebookresearch/segment-anything-2.git NukeSamurai/sam2_repo; \
-    fi
+# System deps
+RUN apt-get update && apt-get install -y \
+    build-essential libgl1 libglib2.0-0 ffmpeg git wget curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and setup files first for caching
-COPY requirements.txt setup.py ./
-
-# Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
-
-# Copy the rest of the application
+# Copy code and checkpoints (everything you need)
 COPY . /app
 
-# Install the application in development mode
+# Install Python deps (from builder cache if possible)
+COPY --from=builder /root/.cache /root/.cache
+
+RUN pip install --upgrade pip && pip install -r requirements.txt
 RUN pip install -e .
+RUN pip install -e NukeSamurai/sam2_repo
+RUN pip install -e NukeSamurai/sam2_repo[notebooks]
 
-# Install SAM2 repo in editable mode
-RUN cd NukeSamurai/sam2_repo && \
-    pip install -e . && \
-    pip install -e ".[notebooks]"
+# Make sure checkpoints are present
+RUN test -f NukeSamurai/sam2_repo/checkpoints/sam2.1_hiera_base_plus.pt
 
-# Download SAM2 model checkpoints
-RUN mkdir -p NukeSamurai/sam2_repo/checkpoints && \
-    cd NukeSamurai/sam2_repo/checkpoints && \
-    if [ -f "download_ckpts.sh" ]; then \
-        chmod +x download_ckpts.sh && \
-        ./download_ckpts.sh; \
-    else \
-        echo "Downloading checkpoints directly..."; \
-        wget -q https://dl.fbaipublicfiles.com/segment_anything_2/sam2_tiny.pt || echo "Failed to download tiny model"; \
-        wget -q https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt || echo "Failed to download tiny model"; \
-        wget -q https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt || echo "Failed to download base_plus model"; \
-    fi
-
-# Create output directory for API results
 RUN mkdir -p Output
 
-# Expose FastAPI port
 EXPOSE 8000
 
-# Create a healthcheck
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/api/v1/health || exit 1
 
-# Default command to run the API server using our CLI
 ENTRYPOINT ["nuke-samurai-server"]
 CMD ["--host", "0.0.0.0", "--port", "8000"] 

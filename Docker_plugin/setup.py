@@ -51,49 +51,39 @@ cuda_device: 0  # Set to -1 for CPU
         print("Creating default configuration file...")
         config_file.write_text(default_config.strip())
 
-def main():
-    # Check Python version
-    check_python_version()
-    
-    # Read requirements
-    with open("requirements.txt") as f:
-        requirements = [line.strip() for line in f.readlines() 
-                       if line.strip() and not line.startswith("#")]
-    
-    # Setup SAM2
-    setup_sam2()
-    
-    # Create default config
-    create_config()
-    
-    # Setup package
-    setup(
-        name="nuke_samurai_api",
-        version="0.1.0",
-        description="NukeSamurai API for EXR image segmentation using SAM2",
-        author="NukeSamurai Team",
-        packages=find_packages(),
-        install_requires=requirements,
-        entry_points={
-            'console_scripts': [
-                'nuke-samurai-server=src.cli:run_server',
-                'nuke-samurai-test=src.cli:run_tests',
-            ],
-        },
-        python_requires=">=3.8",
-        classifiers=[
-            "Programming Language :: Python :: 3",
-            "Programming Language :: Python :: 3.8",
-            "Programming Language :: Python :: 3.9",
-            "Programming Language :: Python :: 3.10",
-            "License :: OSI Approved :: MIT License",
-            "Operating System :: OS Independent",
-            "Topic :: Scientific/Engineering :: Artificial Intelligence",
-            "Topic :: Multimedia :: Graphics",
-        ],
-        include_package_data=True,
-        zip_safe=False,
-    )
+# --- FIX: Read requirements at the top level ---
+check_python_version()
+with open("requirements.txt") as f:
+    requirements = [line.strip() for line in f.readlines() 
+                   if line.strip() and not line.startswith("#")]
+setup_sam2()
+create_config()
 
-if __name__ == "__main__":
-    main() 
+# Setup package
+setup(
+    name="nuke_samurai_api",
+    version="0.1.0",
+    description="NukeSamurai API for EXR image segmentation using SAM2",
+    author="NukeSamurai Team",
+    packages=find_packages(),
+    install_requires=requirements,
+    entry_points={
+        'console_scripts': [
+            'nuke-samurai-server=src.cli:run_server',
+            'nuke-samurai-test=src.cli:run_tests',
+        ],
+    },
+    python_requires=">=3.8",
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "Topic :: Multimedia :: Graphics",
+    ],
+    include_package_data=True,
+    zip_safe=False,
+) 

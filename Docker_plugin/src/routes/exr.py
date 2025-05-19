@@ -180,11 +180,11 @@ async def process_exr(
             logger.error(f"Failed to read EXR file: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Failed to read image: {str(e)}")
             
-        if img is None:
-            raise HTTPException(status_code=400, detail="Failed to read image")
-        image_size = getattr(processor.model, 'image_size', 256)
-        if img.shape[0] != image_size or img.shape[1] != image_size:
-            img = cv2.resize(img, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            if img is None:
+                raise HTTPException(status_code=400, detail="Failed to read image")
+            image_size = getattr(processor.model, 'image_size', 256)
+            if img.shape[0] != image_size or img.shape[1] != image_size:
+                img = cv2.resize(img, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
         # Call model (pass bbox as box, points/labels as points_positive/points_negative)
         result = await processor.generate_mask_async(
             img,
@@ -242,14 +242,14 @@ async def process_sequence(
         
         # Use patched init_state method that handles Windows paths and tensor types
         state, images, frame_start = processor.patched_init_state(
-            sequence_path,
-            offload_video_to_cpu=True,
-            frame_range_min=frame_range[0],
-            frame_range_max=frame_range[1],
-            original_fps=24,
-            target_fps=24,
-            bits=bits,
-        )
+        sequence_path,
+        offload_video_to_cpu=True,
+        frame_range_min=frame_range[0],
+        frame_range_max=frame_range[1],
+        original_fps=24,
+        target_fps=24,
+        bits=bits,
+    )
         
         await progress_tracker.update_progress(task_id, 10, "Sequence loaded successfully")
     except FileNotFoundError as e:
@@ -273,14 +273,14 @@ async def process_sequence(
             points = points_positive + points_negative
             labels = [1] * len(points_positive) + [0] * len(points_negative)
             bbox = prompt.get("bbox")
-            
+
             # Convert to tensors with right types
             points_tensor = torch.tensor(points, dtype=torch.float32) if points else None
             labels_tensor = torch.tensor(labels, dtype=torch.int32) if labels else None
             box_tensor = torch.tensor(bbox, dtype=torch.float32) if bbox is not None else None
-            
+
             logger.info(f"[API] Adding prompt for obj_id={obj_id} at frame_idx={frame_idx}: points+labels={list(zip(points, labels))} bbox={bbox}")
-            
+
             # Add prompt to model
             processor.model.add_new_points_or_box(
                 state, 
@@ -290,11 +290,11 @@ async def process_sequence(
                 frame_idx=frame_idx,
                 obj_id=obj_id
             )
-            
+
             # Ensure all tensors are float32 after adding prompt
             with torch.no_grad():
                 state = processor._convert_tensors_to_float32(state)
-                
+
             # Update progress for each prompt
             prompt_progress = 20 + (i+1) * 10 / len(prompts) if prompts else 30
             await progress_tracker.update_progress(
@@ -421,12 +421,10 @@ async def process_sequence(
     # Process and return results
     try:
         await progress_tracker.update_progress(task_id, 90, "Finalizing output")
-        
         if as_file:
             # Save to output directory instead of streaming
             output_dir = os.path.join("Output", task_id)
             os.makedirs(output_dir, exist_ok=True)
-            
             # Save individual EXR files to output directory
             saved_files = []
             for frame_idx, masks in masks_by_frame.items():
@@ -435,22 +433,18 @@ async def process_sequence(
                 combined_mask = np.zeros(shape, dtype=np.float32)
                 for obj_id, mask in masks.items():
                     combined_mask[mask > 0] = obj_id + 1  # unique label per object
-                
                 # Save as EXR file
                 output_path = os.path.join(output_dir, f"mask_{frame_idx:04d}.exr")
                 write_exr(combined_mask, output_path)
                 saved_files.append(output_path)
-            
             # Also create a ZIP file for convenience
             zip_path = os.path.join(output_dir, f"masks_{task_id}.zip")
             with zipfile.ZipFile(zip_path, "w") as zipf:
                 for file_path in saved_files:
                     zipf.write(file_path, os.path.basename(file_path))
-            
             logger.info(f"Saved {len(saved_files)} mask files to {output_dir}")
             await progress_tracker.update_progress(task_id, 100, f"Completed processing {len(saved_files)} frames")
             await progress_tracker.complete_task(task_id, True)
-            
             # Return file paths instead of streaming content
             return {
                 "status": "success",
@@ -463,14 +457,12 @@ async def process_sequence(
         else:
             # Make sure all data is JSON-serializable
             serializable_masks = convert_response(masks_by_frame)
-            
             # Also save JSON data to file for debugging
             output_dir = os.path.join("Output", task_id)
             os.makedirs(output_dir, exist_ok=True)
             json_path = os.path.join(output_dir, f"masks_{task_id}.json")
             with open(json_path, "w") as f:
                 json.dump(serializable_masks, f)
-            
             await progress_tracker.complete_task(task_id, True)
             return {
                 "result": serializable_masks, 
@@ -497,17 +489,25 @@ async def websocket_progress(websocket: WebSocket, task_id: str):
         while True:
             status = progress_tracker.get_task_status(task_id)
             if status:
-                # Make sure status is serializable
                 await websocket.send_json(convert_response(status.to_dict()))
                 if status.status in ["completed", "failed"]:
                     break
             await asyncio.sleep(0.5)
     except WebSocketDisconnect:
-        if task_id in progress_tracker.connections:
-            progress_tracker.connections[task_id].discard(websocket)
+        pass  # Don't remove from connections here, do it in finally
     except Exception as e:
-        await websocket.close(code=1011, reason=str(e))
+        try:
+            await websocket.close(code=1011, reason=str(e))
+        except:
+            pass
     finally:
+        # Always send the final status if possible
+        status = progress_tracker.get_task_status(task_id)
+        if status and status.status in ["completed", "failed"]:
+            try:
+                await websocket.send_json(convert_response(status.to_dict()))
+            except:
+                pass
         if task_id in progress_tracker.connections:
             progress_tracker.connections[task_id].discard(websocket)
 
@@ -585,7 +585,14 @@ async def get_task_output(task_id: str):
     output_dir = os.path.join("Output", task_id)
     if not os.path.exists(output_dir):
         raise HTTPException(status_code=404, detail=f"No output directory found for task: {task_id}")
-    
+    # Try to load status.json if task not in memory
+    status = progress_tracker.get_task_status(task_id)
+    if not status:
+        status_path = os.path.join(output_dir, "status.json")
+        if os.path.exists(status_path):
+            with open(status_path, "r") as f:
+                data = json.load(f)
+            # Optionally, return status info in the response
     # Collect file information
     files = []
     for file in os.listdir(output_dir):
@@ -596,7 +603,6 @@ async def get_task_output(task_id: str):
             "size": os.path.getsize(file_path),
             "url": f"/api/v1/download/{file}"
         })
-    
     return {
         "task_id": task_id,
         "output_dir": output_dir,
@@ -650,6 +656,13 @@ async def get_task_status(task_id: str):
     if status:
         return convert_response(status.to_dict())
     else:
+        # Try loading from disk (status.json)
+        output_dir = os.path.join("Output", task_id)
+        status_path = os.path.join(output_dir, "status.json")
+        if os.path.exists(status_path):
+            with open(status_path, "r") as f:
+                data = json.load(f)
+            return convert_response(data)
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
 @router.post("/reset")

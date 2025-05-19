@@ -102,137 +102,75 @@ class ThreadedTask:
                     connection_attempts = 0  # Reset counter on successful connection
                     nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection established, monitoring progress..."))
                     
-                    # Keep track of last progress value
-                    last_progress = 0
-                    stuck_count = 0
-                    max_stuck_count = 10  # Exit after being stuck for a while
-                    
-                    # Add timeout for the entire monitoring process
-                    start_time = time.time()
-                    max_websocket_time = 300  # 5 minutes maximum
-                    
                     while self.running:
-                        # Check for timeout
-                        if time.time() - start_time > max_websocket_time:
-                            nuke.executeInMainThread(lambda: nuke.tprint(f"WebSocket monitoring timed out after {max_websocket_time} seconds"))
-                            break
-                            
                         try:
-                            # Use timeout to prevent waiting forever
                             data = await asyncio.wait_for(websocket.recv(), timeout=30)
                             progress_data = json.loads(data)
-                            
-                            # Get progress details
-                            progress = progress_data.get('progress', 0)
+                            progress = int(progress_data.get('progress', 0))
                             message = progress_data.get('message', '')
                             status = progress_data.get('status', 'running')
-                            
-                            # Update UI in main thread
                             nuke.executeInMainThread(lambda p=progress, m=message: self.on_progress(p, m))
-                            
-                            # Check if progress is stuck
-                            if progress == last_progress:
-                                stuck_count += 1
-                                if stuck_count >= max_stuck_count:
-                                    nuke.executeInMainThread(lambda: nuke.tprint(f"Progress stuck at {progress}% for {max_stuck_count} updates, exiting monitor"))
-                                    break
-                            else:
-                                stuck_count = 0
-                                last_progress = progress
-                            
-                            # Exit if task is completed or failed
                             if status in ['completed', 'failed']:
                                 if status == 'completed':
-                                    # Ensure we get to 100% when complete
                                     completed = True
                                     nuke.executeInMainThread(lambda: self.on_progress(100, "Processing completed successfully"))
-                                
                                 if status == 'failed':
                                     error = progress_data.get('error', 'Unknown error')
                                     nuke.executeInMainThread(lambda e=error: self.on_error(f"Task failed: {e}"))
                                 break
-                                
                         except asyncio.TimeoutError:
-                            # Timeout waiting for messages, check if connection is still alive
                             try:
                                 pong_event = await websocket.ping()
                                 await asyncio.wait_for(pong_event, timeout=5)
-                                # Ping succeeded, continue monitoring
                                 nuke.executeInMainThread(lambda: nuke.tprint("WebSocket ping successful, connection still active"))
                             except asyncio.TimeoutError:
-                                # Server did not respond to ping
                                 nuke.executeInMainThread(lambda: nuke.tprint("WebSocket ping failed, reconnecting..."))
                                 break
                             except Exception as ping_error:
                                 nuke.executeInMainThread(lambda e=ping_error: nuke.tprint(f"Error pinging WebSocket: {e}"))
                                 break
                         except Exception as e:
-                            # Error receiving progress update
                             nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error receiving WebSocket data: {e}"))
                             await asyncio.sleep(2)
-                    
-                    # If we reached here and task is completed, we're done
                     if completed:
                         return
-                        
             except Exception as connection_error:
-                # WebSocket connection error, try again or fall back to HTTP polling
                 connection_attempts += 1
                 nuke.executeInMainThread(lambda e=connection_error: 
                     nuke.tprint(f"WebSocket connection error (attempt {connection_attempts}/{max_connection_attempts}): {e}"))
                 if connection_attempts < max_connection_attempts:
-                    await asyncio.sleep(2)  # Wait before retrying
+                    await asyncio.sleep(2)
                     continue
                 else:
-                    # All connection attempts failed, fall back to HTTP polling
                     nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection failed, falling back to HTTP polling"))
                     break
-        
-        # Fall back to HTTP polling if WebSocket failed
+        # HTTP polling fallback
         try:
-            # Poll the server for status every 3 seconds
             status_url = f"{API_BASE_URL}/api/{API_VERSION}/status/{task_id}"
             polling_start_time = time.time()
             max_polling_time = 300  # 5 minutes maximum
-            
             while self.running and time.time() - polling_start_time < max_polling_time:
                 try:
                     status_response = requests.get(status_url, timeout=5)
                     if status_response.status_code == 200:
-                        # Parse status update
-                        status_data = status_response.json()
-                        progress = status_data.get('progress', 0)
-                        message = status_data.get('message', '')
-                        status = status_data.get('status', 'running')
-                        
-                        # Update progress in main thread
+                        progress_data = status_response.json()
+                        progress = int(progress_data.get('progress', 0))
+                        message = progress_data.get('message', '')
+                        status = progress_data.get('status', 'running')
                         nuke.executeInMainThread(lambda p=progress, m=message: self.on_progress(p, m))
-                        
-                        # Exit if task is completed or failed
                         if status in ['completed', 'failed']:
                             if status == 'completed':
-                                # Ensure we get to 100% when complete
-                                completed = True
                                 nuke.executeInMainThread(lambda: self.on_progress(100, "Processing completed successfully"))
-                            
                             if status == 'failed':
-                                error = status_data.get('error', 'Unknown error')
+                                error = progress_data.get('error', 'Unknown error')
                                 nuke.executeInMainThread(lambda e=error: self.on_error(f"Task failed: {e}"))
                             break
-                except requests.exceptions.RequestException as e:
+                    time.sleep(3)
+                except Exception as e:
                     nuke.executeInMainThread(lambda e=e: nuke.tprint(f"HTTP polling error: {e}"))
-                
-                await asyncio.sleep(3)
-                
-            if time.time() - polling_start_time >= max_polling_time:
-                nuke.executeInMainThread(lambda: nuke.tprint("HTTP polling timed out"))
+                    time.sleep(3)
         except Exception as e:
-            nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error in HTTP polling fallback: {e}"))
-        
-        # Make sure we always set 100% when completing download and no error was reported
-        # This handles cases where the WebSocket disconnects before final update
-        if not completed and self.running and not hasattr(self, '_error_reported'):
-            nuke.executeInMainThread(lambda: self.on_progress(100, "Download completed"))
+            nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error checking task output: {e}"))
 
 class Prompt:
     def __init__(self):
@@ -313,26 +251,23 @@ class BoundingBox:
                             current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
                         except:
                             current_obj_id = 0
-                            
                         # Create new prompt or find existing one
                         prompt = None
                         for p in cls.prompts:
                             if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
                                 prompt = p
                                 break
-                        
                         if prompt is None:
                             prompt = Prompt()
                             prompt.frame_index = cls.current_frame
                             prompt.object_id = current_obj_id
                             cls.prompts.append(prompt)
-                        
                         # Add bbox to prompt
                         prompt.bbox = [cls.current_box[0], cls.current_box[1], 
-                                     cls.current_box[0] + cls.current_box[2], 
-                                     cls.current_box[1] + cls.current_box[3]]
+                                       cls.current_box[0] + cls.current_box[2], 
+                                       cls.current_box[1] + cls.current_box[3]]
                         nuke.tprint(f"Added box for object {current_obj_id} on frame {cls.current_frame}: {prompt.bbox}")
-                    cls.current_box = None
+                        cls.current_box = None
 
         # Dictionary to store current mouse position
         mouse_pos = {'current_pos': (0, 0)}
@@ -437,20 +372,17 @@ class BoundingBox:
                     current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
                 except:
                     current_obj_id = 0
-                    
                 # Create new prompt or find existing one
                 prompt = None
                 for p in cls.prompts:
                     if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
                         prompt = p
                         break
-                
                 if prompt is None:
                     prompt = Prompt()
                     prompt.frame_index = cls.current_frame
                     prompt.object_id = current_obj_id
                     cls.prompts.append(prompt)
-                
                 # Add point to prompt
                 prompt.points_positive.append([x, y])
                 nuke.tprint(f"Added positive point for object {current_obj_id} on frame {cls.current_frame}: {x = }, {y = }")
@@ -462,20 +394,17 @@ class BoundingBox:
                     current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
                 except:
                     current_obj_id = 0
-                    
                 # Create new prompt or find existing one
                 prompt = None
                 for p in cls.prompts:
                     if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
                         prompt = p
                         break
-                
                 if prompt is None:
                     prompt = Prompt()
                     prompt.frame_index = cls.current_frame
                     prompt.object_id = current_obj_id
                     cls.prompts.append(prompt)
-                
                 # Add point to prompt
                 prompt.points_negative.append([x, y])
                 nuke.tprint(f"Added negative point for object {current_obj_id} on frame {cls.current_frame}: {x = }, {y = }")
@@ -546,7 +475,7 @@ class BoundingBox:
         # Send data to API
         try:
             response = requests.post(
-                f"{API_BASE_URL}/{API_VERSION}/segment",
+                f"{API_BASE_URL}/api/{API_VERSION}/process_exr",
                 json={"prompts": prompts_data}
             )
             response.raise_for_status()
@@ -695,7 +624,8 @@ def GenerateMask():
     original_fps = int(InputInfos.original_fps)
     target_fps = int(nuke.thisNode().knob('FPS').value())
     bits = InputInfos.bits
-    model_type = nuke.thisNode().knob('ModelType').value().lower()
+    model_type_ui = nuke.thisNode().knob('ModelType').value().lower()
+    model_type = 'base-plus' if model_type_ui == 'base' else model_type_ui
 
     # Create a threaded task for loading the model
     def load_model():
@@ -755,12 +685,14 @@ def GenerateMask():
             output_endpoint = f"{API_BASE_URL}/api/{API_VERSION}/output/{task_id}"
             max_attempts = 60  # 5 minutes at 5-second intervals
             attempt = 0
-            
+            error_count = 0
+            max_error_count = 10
             while attempt < max_attempts and process_task.running:
                 attempt += 1
                 try:
                     output_response = requests.get(output_endpoint, timeout=5)
                     if output_response.status_code == 200:
+                        error_count = 0  # Reset error count on success
                         output_data = output_response.json()
                         
                         # Find the ZIP file
@@ -794,7 +726,6 @@ def GenerateMask():
                                 for i, chunk in enumerate(download_response.iter_content(chunk_size=8192)):
                                     f.write(chunk)
                                     total_downloaded += len(chunk)
-                                    
                                     # Update progress every 20 chunks
                                     if i % 20 == 0:
                                         if file_size > 0:
@@ -804,7 +735,7 @@ def GenerateMask():
                                         else:
                                             # If file size unknown, just show intermediate progress
                                             nuke.executeInMainThread(lambda: update_status_safely("Downloading..."))
-                            
+            
                             # Always make sure we're at 95% after download
                             nuke.executeInMainThread(lambda: update_status_safely("Download complete, extracting files..."))
                             
@@ -858,8 +789,13 @@ def GenerateMask():
                         else:
                             # No ZIP file yet, keep waiting
                             time.sleep(5)
+                    elif output_response.status_code in [404, 503]:
+                        error_count += 1
+                        if error_count >= max_error_count:
+                            nuke.executeInMainThread(lambda: nuke.message(f"Task output unavailable (status {output_response.status_code}) for {error_count} attempts. Stopping."))
+                            break
+                        time.sleep(5)
                     else:
-                        # Task not ready yet
                         time.sleep(5)
                 except Exception as e:
                     nuke.tprint(f"Error checking task output: {str(e)}")
@@ -887,14 +823,13 @@ def GenerateMask():
                         for i, chunk in enumerate(download_response.iter_content(chunk_size=8192)):
                             f.write(chunk)
                             total_downloaded += len(chunk)
-                            
                             # Update progress every 20 chunks
                             if i % 20 == 0:
                                 if total_size > 0:
                                     # Calculate download progress (90-95%)
                                     download_progress = 90 + (total_downloaded / total_size) * 5
                                     nuke.executeInMainThread(lambda p=download_progress: update_status_safely(f"Download progress: {int(p)}%"))
-                            else:
+                                else:
                                     # If file size unknown, just show intermediate progress
                                     nuke.executeInMainThread(lambda: update_status_safely("Downloading..."))
                     
@@ -1065,8 +1000,8 @@ def CreateSAM2Node():
     s.addKnob(nuke.Int_Knob("FrameRangeMax", ' '))
     s.addKnob(nuke.Int_Knob("FPS", 'Output Frame Rate'))
     
-    # Model selection - fixed model types
-    s.addKnob(nuke.Enumeration_Knob('ModelType', 'Model type', ['base', 'large', 'small', 'tiny']))
+    # Model selection - user-friendly names
+    s.addKnob(nuke.Enumeration_Knob('ModelType', 'Model type', ['Base', 'Large', 'Small', 'Tiny']))
     
     # Object Selection - improved with dropdown
     s.addKnob(nuke.Double_Knob('CurrentObjectID', 'Object ID'))
@@ -1119,7 +1054,7 @@ def CreateSAM2Node():
     s['ClearPrompts'].setTooltip("Clear all selections")
     s['ResetState'].setTooltip("Reset model state and clear GPU memory")
     s['FPS'].setTooltip("Target FPS for the output video")
-    s['ModelType'].setTooltip("Choose your model type: base, large, small, or tiny")
+    s['ModelType'].setTooltip("Choose your model type: Base, Large, Small, or Tiny")
     s['OutputPath'].setTooltip("path/to/your/file_####.exr, to create an image sequence add #### or ###")
     s['GenerateMask'].setTooltip("Generate Mask")
     s['StatusMessage'].setTooltip("Current processing status")

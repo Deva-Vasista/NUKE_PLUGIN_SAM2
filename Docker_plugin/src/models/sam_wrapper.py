@@ -336,10 +336,10 @@ class SAMProcessor:
                 sequence_path,
                 frame_range_min=frame_range[0],
                 frame_range_max=frame_range[1],
-                original_fps=original_fps,
-                target_fps=target_fps,
-                bits=bits
-            )
+                    original_fps=original_fps,
+                    target_fps=target_fps,
+                    bits=bits
+                )
         except Exception as e:
             logger.error(f"[ERROR] Model init_state failed: {e}")
             raise
@@ -418,11 +418,9 @@ class SAMProcessor:
                         logger.info(f"[DEBUG] propagate_in_video yielded idx={idx}, masks type={type(masks)}, shape={getattr(masks, 'shape', None)}, dtype={masks.dtype}")
                     masks_list.append(masks.cpu().numpy())
                     yield frame_idx, object_ids, masks
-                    
             # Apply the conversion during propagation
             for _ in propagate_with_conversion():
                 pass
-                    
         except RuntimeError as e:
             if "expected scalar type Float but found BFloat16" in str(e):
                 logger.error(f"[ERROR] Data type mismatch (BFloat16 vs Float): {e}")
@@ -449,7 +447,6 @@ class SAMProcessor:
         except Exception as e:
             logger.error(f"[ERROR] propagate_in_video failed: {e}")
             raise
-            
         return masks_list
 
     def reset_state(self):
