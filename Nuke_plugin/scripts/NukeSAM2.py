@@ -960,7 +960,18 @@ def reset_model_state():
         
         # Make API call to reset endpoint
         response = requests.post(f"{API_BASE_URL}/api/{API_VERSION}/reset")
-        response.raise_for_status()  # Raise exception for non-200 status codes
+        try:
+            response.raise_for_status()  # Raise exception for non-200 status codes
+        except Exception as e:
+            # Log the error and show backend response
+            error_detail = response.text
+            nuke.tprint(f"Reset API call failed: {e}, Response: {error_detail}")
+            nuke.message(f"Failed to reset model state. Server response: {error_detail}")
+            update_status_safely(f"Error: Failed to reset model state. Server response: {error_detail}")
+            return
+        
+        # Log the successful response for debugging
+        nuke.tprint(f"Reset API call succeeded: {response.status_code}, Response: {response.text}")
         
         # Reset local UI state
         update_status_safely("Model state reset successfully")
@@ -978,10 +989,12 @@ def reset_model_state():
             
     except requests.exceptions.ConnectionError:
         error_msg = "Failed to connect to API server. Please ensure the server is running."
+        nuke.tprint(error_msg)
         nuke.message(error_msg)
         update_status_safely(f"Error: {error_msg}")
     except Exception as e:
         error_msg = f"Failed to reset model state: {str(e)}"
+        nuke.tprint(error_msg)
         nuke.message(error_msg)
         update_status_safely(f"Error: {error_msg}")
 
@@ -1087,4 +1100,10 @@ async def monitor_progress(task_id):
     """This function is kept for backward compatibility but is no longer used.
        Progress monitoring is now handled by the ThreadedTask class."""
     nuke.tprint("Warning: Deprecated monitor_progress function called. Please update your code to use ThreadedTask.")
-    pass 
+    pass
+
+# Register functions for Nuke PyScript_Knobs
+import __main__
+__main__.reset_model_state = reset_model_state
+__main__.CreateSAM2Node = CreateSAM2Node
+# (Add any other functions you want to call from knobs) 

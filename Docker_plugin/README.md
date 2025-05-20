@@ -1,155 +1,130 @@
 # NukeSamurai Backend
 
-Backend server for the NukeSamurai plugin, providing SAM2 (Segment Anything Model 2) functionality through a REST API.
+NukeSamurai Backend is a FastAPI server that brings Meta's Segment Anything Model 2 (SAM2) to VFX workflows, enabling high-quality, automated rotoscoping and object segmentation for EXR image sequences. It is designed to be used with the NukeSamurai plugin for NUKE, but can be accessed by any client via HTTP APIs.
 
-## Prerequisites
+---
 
-- Python 3.8 or higher
-- CUDA-capable GPU (recommended)
-- Git
-- pip 20.0 or higher (for dependency management)
+## Features
+- **EXR sequence segmentation and tracking** using SAM2
+- **REST API** for easy integration with Nuke or other tools
+- **GPU acceleration** (CUDA) and CPU fallback
+- **Progress tracking** via WebSocket or polling
+- **Batch and single-frame processing**
+- **Dockerized for easy deployment**
 
-## Installation
+---
 
-1. Clone the repository with submodules:
+## API Endpoints (Summary)
+
+All endpoints are under `/api/v1` unless otherwise noted.
+
+### Core Endpoints
+- `POST   /process_exr`         — Segment a single EXR image (bbox/points)
+- `POST   /process_sequence`    — Track/segment across a sequence (multi-frame, multi-object)
+- `POST   /batch/process_batch` — Batch process multiple sequences
+- `POST   /reset`               — Reset model state and clear GPU memory
+- `GET    /output/{task_id}`    — Get output files for a task
+- `GET    /download/{filename}` — Download a result file
+- `GET    /download_all/{task_id}` — Download all results for a task
+- `GET    /status/{task_id}`    — Get status of a processing task
+- `WS     /ws/{task_id}`        — WebSocket for progress updates
+
+### Model Management
+- `POST   /models/load`         — Load a specific SAM2 model (large, base-plus, small, tiny)
+- `GET    /models/status`       — Get current model status
+- `POST   /models/unload`       — Unload the current model
+
+### GPU & Health
+- `GET    /health`              — Health check
+- `GET    /gpu/info`            — GPU info
+- `GET    /gpu/memory`          — GPU memory stats
+- `POST   /gpu/clear-cache`     — Clear GPU memory cache
+
+For detailed request/response formats, see [Wikis/API.md](../Wikis/API.md).
+
+---
+
+## Quickstart: Docker Deployment
+
+### 1. Prerequisites
+- [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)
+- (Optional) NVIDIA GPU and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) for GPU acceleration
+
+### 2. Build and Run (GPU)
 ```bash
-git clone --recursive https://github.com/your-repo/NPP.git
-cd NPP/Docker_plugin
+cd Docker_plugin
+# Build and start the API (GPU version)
+docker-compose up --build
 ```
+- The API will be available at `http://localhost:8000`
+- EXR data and output directories are mounted via volumes (see `docker-compose.yml`)
 
-2. Create and activate a virtual environment:
+### 3. Build and Run (CPU-only)
 ```bash
-# On Linux/Mac:
+cd Docker_plugin
+docker-compose --profile cpu up --build
+```
+- The API will be available at `http://localhost:8001`
+
+### 4. Customizing Paths
+- To use custom data/output/checkpoints, set environment variables:
+  - `EXR_DATA_PATH`, `OUTPUT_PATH`, `CHECKPOINTS_PATH`
+- Example:
+  ```bash
+  EXR_DATA_PATH=/my/exr INPUT_PATH OUTPUT_PATH=/my/output docker-compose up --build
+  ```
+
+---
+
+## Manual Setup (Without Docker)
+
+### 1. Prerequisites
+- Python 3.8+
+- CUDA-capable GPU (recommended) or CPU
+- pip, git
+
+### 2. Install dependencies and package
+```bash
+cd Docker_plugin
 python -m venv .venv
-source .venv/bin/activate
-
-# On Windows:
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-3. Upgrade pip and install build tools:
-```bash
-python -m pip install --upgrade pip
-python -m pip install --upgrade setuptools wheel
-```
-
-4. Install the package in development mode:
-```bash
+source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+pip install --upgrade pip setuptools wheel
 pip install -e .
 ```
+- This will:
+  - Check Python version
+  - Install all dependencies
+  - Set up the SAM2 repo and config
+  - Register CLI tools: `nuke-samurai-server`, `nuke-samurai-test`
 
-Note: Do NOT run `python setup.py` directly. Always use `pip install -e .` as it:
-- Properly handles dependency resolution
-- Installs required build tools
-- Sets up the package in development mode
-- Runs all necessary installation steps in the correct order
-
-The installation will:
-- Check Python version compatibility
-- Install all required dependencies
-- Set up the SAM2 repository
-- Create default configuration files
-- Set up command-line tools
-
-5. Verify the installation:
-```bash
-# Check if the command-line tools are installed
-nuke-samurai-server --version
-
-# Check if SAM2 is properly installed
-python -c "from sam2.utils.transforms import ResizeLongestSide; print('SAM2 installed successfully')"
-```
-
-## Configuration
-
-The default configuration is created in `configs/config.yaml`. You can modify it to change:
-- API host and port
-- Log level
-- Output directory
-- CUDA device
-- Batch size
-
-Example configuration:
-```yaml
-api_host: "0.0.0.0"
-api_port: 8000
-log_level: "INFO"
-output_dir: "Output"
-max_batch_size: 32
-cuda_device: 0  # Set to -1 for CPU
-```
-
-## Running the Server
-
-1. Start the API server:
+### 3. Run the API server
 ```bash
 nuke-samurai-server
+# or with custom options:
+nuke-samurai-server --host 0.0.0.0 --port 8000 --log-level info
 ```
 
-2. The server will be available at `http://localhost:8000`
-
-3. Check the API is running:
+### 4. Verify
 ```bash
 curl http://localhost:8000/api/v1/health
 ```
 
-## Development
+---
 
-1. Run tests:
-```bash
-nuke-samurai-test
-```
+## About the Project
+- **Backend:** FastAPI, PyTorch, OpenCV, SAM2
+- **Frontend:** Nuke plugin (see Nuke_plugin/)
+- **Docs:** See [Wikis/](../Wikis/) for API, architecture, and usage details
 
-2. Format code:
-```bash
-black src/
-isort src/
-```
+---
 
 ## Troubleshooting
+- **CUDA errors:** Check your GPU drivers and CUDA install, or run in CPU mode
+- **Missing checkpoints:** Ensure all required `.pt` files are in `NukeSamurai/sam2_repo/checkpoints/`
+- **Permissions:** Make sure output directories are writable
+- **See logs:** Check `logs/api.log` for backend errors
 
-1. If you get CUDA errors:
-   - Check your CUDA installation
-   - Try setting `cuda_device: -1` in config.yaml to use CPU
-   - Verify PyTorch is installed with CUDA support: `python -c "import torch; print(torch.cuda.is_available())"`
-
-2. If SAM2 installation fails:
-   - Check the SAM2 submodule is properly cloned:
-     ```bash
-     git submodule update --init --recursive
-     ```
-   - Try installing manually:
-     ```bash
-     cd NukeSamurai/sam2_repo
-     pip install -e .
-     pip install -e .[notebooks]
-     ```
-   - Check for compiler errors in the logs
-
-3. If the server won't start:
-   - Check the port is not in use: `netstat -ano | findstr :8000` (Windows) or `lsof -i :8000` (Linux)
-   - Check the logs in `logs/` directory
-   - Verify all dependencies are installed: `pip freeze`
-   - Try running with debug logging: `nuke-samurai-server --log-level debug`
-
-4. Common Installation Issues:
-   - If you get "command not found" errors, make sure your virtual environment is activated
-   - If you get build errors, install required system packages:
-     ```bash
-     # Ubuntu/Debian:
-     sudo apt-get update
-     sudo apt-get install python3-dev build-essential
-
-     # CentOS/RHEL:
-     sudo yum groupinstall "Development Tools"
-     sudo yum install python3-devel
-     ```
-
-## API Documentation
-
-See [API.md](../Wikis/API.md) for detailed API documentation.
+---
 
 ## License
-
-MIT License - see LICENSE file for details 
+MIT License — see LICENSE for details 
