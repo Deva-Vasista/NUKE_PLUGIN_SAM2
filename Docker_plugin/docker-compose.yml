@@ -10,13 +10,6 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
-    volumes:
-      # Mount your EXR files directory for processing
-      - ${EXR_DATA_PATH:-./Test_files}:/data
-      # Mount output directory for results (optional, for persistence)
-      - ${OUTPUT_PATH:-./Output}:/app/Output
-      # If you want to override checkpoints, uncomment the next line:
-      # - ${CHECKPOINTS_PATH:-./checkpoints}:/app/NukeSamurai/sam2_repo/checkpoints
     environment:
       # Set to 'cpu' if no GPU is available
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
@@ -26,6 +19,8 @@ services:
       - SAM2_BUILD_CUDA=${SAM2_BUILD_CUDA:-1}
       # Enable OpenEXR support in OpenCV
       - OPENCV_IO_ENABLE_OPENEXR=1
+    volumes:
+      - /media/ptgml/ptg/vasista/NUKE_PLUGIN_SAM2/Downloads/frames/output_dir:/data
     deploy:
       resources:
         reservations:
@@ -51,10 +46,6 @@ services:
     restart: unless-stopped
     ports:
       - "8001:8000"
-    volumes:
-      - ${EXR_DATA_PATH:-./Test_files}:/data
-      - ${OUTPUT_PATH:-./Output}:/app/Output
-      # - ${CHECKPOINTS_PATH:-./checkpoints}:/app/NukeSamurai/sam2_repo/checkpoints
     environment:
       - CUDA_VISIBLE_DEVICES=""
       - DEBUG=${DEBUG:-false}

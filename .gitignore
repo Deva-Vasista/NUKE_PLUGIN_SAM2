@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+Docker_plugin/NukeSamurai/sam2_repo/checkpoints/*.pt
 Test_files/*
 Docker_plugin/Output/*
 Docker_plugin/masks/*
