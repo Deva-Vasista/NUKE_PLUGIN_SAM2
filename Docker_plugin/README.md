@@ -9,7 +9,7 @@ NukeSamurai Backend is a FastAPI server that brings Meta's Segment Anything Mode
 - **REST API** for easy integration with Nuke or other tools
 - **GPU acceleration** (CUDA) and CPU fallback
 - **Progress tracking** via WebSocket or polling
-- **Batch and single-frame processing**
+#- **Batch and single-frame processing**
 - **Dockerized for easy deployment**
 
 ---
@@ -84,9 +84,11 @@ docker-compose --profile cpu up --build
 - pip, git
 
 ### 2. Install dependencies and package
+>[!NOTE]
+>This Application requires a python version 3.10
 ```bash
 cd Docker_plugin
-python -m venv .venv
+python3.10 -m venv .venv
 source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 pip install --upgrade pip setuptools wheel
 pip install -e .
