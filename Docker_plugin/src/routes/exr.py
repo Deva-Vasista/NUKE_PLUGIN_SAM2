@@ -182,10 +182,27 @@ async def process_exr(
             
             if img is None:
                 raise HTTPException(status_code=400, detail="Failed to read image")
-            image_size = getattr(processor.model, 'image_size', 256)
-            if img.shape[0] != image_size or img.shape[1] != image_size:
-                img = cv2.resize(img, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-        # Call model (pass bbox as box, points/labels as points_positive/points_negative)
+            
+        # Get image dimensions for coordinate normalization
+        height, width = img.shape[:2]
+        
+        # Normalize coordinates to [0,1] range
+        # Commented out since normalization is now handled in frontend
+        # if bbox is not None:
+        #     bbox = [
+        #         bbox[0] / width,  # x1
+        #         bbox[1] / height,  # y1
+        #         bbox[2] / width,  # x2
+        #         bbox[3] / height   # y2
+        #     ]
+            
+        # if points_positive:
+        #     points_positive = [[x / width, y / height] for x, y in points_positive]
+            
+        # if points_negative:
+        #     points_negative = [[x / width, y / height] for x, y in points_negative]
+            
+        # Call model with normalized coordinates
         result = await processor.generate_mask_async(
             img,
             bbox,

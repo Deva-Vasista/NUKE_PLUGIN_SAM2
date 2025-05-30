@@ -79,6 +79,37 @@ curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
   }' \
   --output "$OUTDIR/masks_multiobj_multiframe.zip"
 
+
+
+
+  #curl2
+  curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true"   -H "Content-Type: application/json"   -d '{
+    "sequence_path": "/mnt/PTGData/vasista/NPP/NUKE_PLUGIN_SAM2/Test_files/frames/output_dir/frame_%04d.exr",
+    "frame_range": [1, 100],
+    "prompts": [
+      { "frame_index": 1, "object_id": 0, "bbox":[487, 292, 940, 907] },
+      { "frame_index": 53, "object_id": 1,"bbox": [1341, 547, 1910, 902] }
+    ],
+    "bits": "32-bit float"
+  }'   --output "$OUTDIR/masks_multiobj_multiframe_curl.zip"
+
+
+
+
+
+curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sequence_path": "/mnt/PTGData/vasista/NPP/NUKE_PLUGIN_SAM2/Test_files/frames/output_dir/frame_%04d.exr",
+    "frame_range": [1, 100],
+    "prompts": [
+      { "frame_index": 1, "object_id": 0, "bbox":[487, 292, 940, 907] },
+      { "frame_index": 53, "object_id": 1,"bbox": [1341, 547, 1910, 902] }
+    ],
+    "bits": "32-bit float"
+  }' \
+  --output "$OUTDIR/masks_multiobj_multiframe_curl.zip"
+
 # 7. Test /process_sequence with reverse tracking
 curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
   -H "Content-Type: application/json" \

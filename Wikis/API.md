@@ -30,10 +30,21 @@ Response:
 }
 ```
 
+Example:
+```bash
+curl -X POST "http://localhost:8000/api/v1/models/load" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_type": "base"
+  }'
+```
+
 ### 2. Process Single Frame
 ```
 POST /process_exr
 ```
+
+Process a single EXR frame with bounding box and/or point prompts. The model will generate a mask for the selected object.
 
 Query Parameters:
 - `as_file` (boolean): Return mask as EXR file if true, else as list
@@ -42,17 +53,58 @@ Request Body:
 ```json
 {
     "image_path": "/path/to/frame.exr",
-    "bbox": [x1, y1, x2, y2],  // Optional
-    "points_positive": [[x1,y1], [x2,y2]],  // Optional
-    "points_negative": [[x1,y1], [x2,y2]],  // Optional
+    "bbox": [x1, y1, x2, y2],  // Optional: Bounding box coordinates
+    "points_positive": [[x1,y1], [x2,y2]],  // Optional: Points to select
+    "points_negative": [[x1,y1], [x2,y2]],  // Optional: Points to remove
     "bits": "32-bit float"  // Optional, defaults to "32-bit float"
 }
+```
+
+Example with bbox:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_path": "/path/to/frame.exr",
+    "bbox": [454, 185, 500, 633],
+    "bits": "32-bit float"
+  }' \
+  --output mask.exr
+```
+
+Example with points:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_path": "/path/to/frame.exr",
+    "points_positive": [[610, 728], [612, 730]],
+    "points_negative": [[500, 500]],
+    "bits": "32-bit float"
+  }' \
+  --output mask.exr
+```
+
+Example with both bbox and points:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_path": "/path/to/frame.exr",
+    "bbox": [454, 185, 500, 633],
+    "points_positive": [[610, 728]],
+    "points_negative": [[500, 500]],
+    "bits": "32-bit float"
+  }' \
+  --output mask.exr
 ```
 
 ### 3. Process Sequence
 ```
 POST /process_sequence
 ```
+
+Process a sequence of EXR files with multi-object tracking. The model will track objects across frames and generate masks for each frame.
 
 Query Parameters:
 - `as_file` (boolean): Return masks as ZIP if true, else as JSON list
@@ -71,10 +123,60 @@ Request Body:
             "points_negative": [[x1,y1]]  // Optional
         }
     ],
-    "bits": "32-bit float",  // Optional, defaults to "32-bit float"
-    "original_fps": 24,  // Optional, defaults to input file fps
-    "target_fps": 24  // Optional, defaults to original_fps
+    "bits": "32-bit float"  // Optional, defaults to "32-bit float"
 }
+```
+
+Example with single object:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sequence_path": "/path/to/frames/frame_%04d.exr",
+    "frame_range": [1, 20],
+    "prompts": [
+      { "frame_index": 0, "bbox": [454, 185, 500, 633] }
+    ],
+    "bits": "32-bit float"
+  }' \
+  --output masks.zip
+```
+
+Example with multiple objects:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sequence_path": "/path/to/frames/frame_%04d.exr",
+    "frame_range": [1, 20],
+    "prompts": [
+      { "frame_index": 0, "object_id": 0, "bbox": [454, 185, 500, 633] },
+      { "frame_index": 10, "object_id": 1, "points_positive": [[1689, 216]] }
+    ],
+    "bits": "32-bit float"
+  }' \
+  --output masks.zip
+```
+
+Example with points and bbox:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sequence_path": "/path/to/frames/frame_%04d.exr",
+    "frame_range": [1, 20],
+    "prompts": [
+      { 
+        "frame_index": 0, 
+        "object_id": 0, 
+        "bbox": [454, 185, 500, 633],
+        "points_positive": [[610, 728]],
+        "points_negative": [[500, 500]]
+      }
+    ],
+    "bits": "32-bit float"
+  }' \
+  --output masks.zip
 ```
 
 Response:
@@ -103,6 +205,23 @@ Connect to this WebSocket endpoint to receive progress updates:
 }
 ```
 
+Example using Python:
+```python
+import websockets
+import asyncio
+import json
+
+async def monitor_progress(task_id):
+    uri = f"ws://localhost:8000/api/v1/ws/{task_id}"
+    async with websockets.connect(uri) as websocket:
+        while True:
+            response = await websocket.recv()
+            status = json.loads(response)
+            print(f"Progress: {status['progress']}% - {status['message']}")
+            if status['status'] in ['completed', 'failed']:
+                break
+```
+
 ### 5. Get Task Output
 ```
 GET /output/{task_id}
@@ -128,12 +247,24 @@ GET /download/{filename}
 
 Returns the requested file (ZIP or EXR) as a binary response.
 
+Example:
+```bash
+curl -X GET "http://localhost:8000/api/v1/download/masks_uuid-string.zip" \
+  --output masks.zip
+```
+
 ### 7. Download All Results
 ```
 GET /download_all/{task_id}
 ```
 
 Returns a ZIP file containing all output files for the task.
+
+Example:
+```bash
+curl -X GET "http://localhost:8000/api/v1/download_all/uuid-string" \
+  --output all_files.zip
+```
 
 ### 8. Get Task Status
 ```
@@ -180,69 +311,29 @@ Response:
 }
 ```
 
-## Example Curl Commands
+## Common Issues and Solutions
 
-1. Load model:
-```bash
-curl -X POST "http://localhost:8000/api/v1/models/load" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model_type": "base"
-  }'
-```
+1. **File Not Found**
+   - Ensure the image path is correct and accessible to the backend
+   - For Windows paths, they will be automatically converted to WSL paths
+   - Check file permissions
 
-2. Process single frame with bbox:
-```bash
-curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "image_path": "/path/to/frame.exr",
-    "bbox": [454, 185, 500, 633],
-    "bits": "32-bit float"
-  }' \
-  --output "mask.exr"
-```
+2. **No Prompt Provided**
+   - Must provide at least one of: bbox, points_positive, or points_negative
+   - For sequences, at least one prompt must be provided in the prompts list
 
-3. Process sequence with multiple objects:
-```bash
-curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sequence_path": "/path/to/frame_%04d.exr",
-    "frame_range": [1, 20],
-    "prompts": [
-      { "frame_index": 0, "object_id": 0, "points_positive": [[610,728]] },
-      { "frame_index": 1, "object_id": 0, "points_positive": [[700,800]] },
-      { "frame_index": 0, "object_id": 1, "bbox": [454, 185, 500, 633] },
-      { "frame_index": 2, "object_id": 1, "points_negative": [[300,400]] }
-    ],
-    "bits": "32-bit float",
-    "original_fps": 24,
-    "target_fps": 24
-  }' \
-  --output "masks.zip"
-```
+3. **Invalid Coordinates**
+   - Coordinates should be within the image dimensions
+   - Bbox format: [x1, y1, x2, y2] where (x1,y1) is top-left and (x2,y2) is bottom-right
+   - Points format: [[x1,y1], [x2,y2], ...]
 
-4. Monitor progress with WebSocket:
-```javascript
-const ws = new WebSocket('ws://localhost:8000/api/v1/ws/task-id-here');
-ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    console.log(`Progress: ${data.progress}% - ${data.message}`);
-    if (data.status === 'completed') {
-        console.log('Processing completed!');
-    } else if (data.status === 'failed') {
-        console.error('Processing failed:', data.error);
-    }
-};
-```
+4. **Memory Issues**
+   - If you encounter GPU memory errors, try:
+     - Using a smaller model (e.g., "small" instead of "large")
+     - Processing smaller frame ranges
+     - Resetting the model state between operations
 
-5. Reset model state:
-```bash
-curl -X POST "http://localhost:8000/api/v1/reset"
-```
-
-6. Check API health:
-```bash
-curl "http://localhost:8000/api/v1/health"
-``` 
+5. **Output Format**
+   - Single frame: Returns either an EXR file or a JSON array
+   - Sequence: Returns either a ZIP of EXR files or a JSON object with frame indices
+   - Use `as_file=true` to get file outputs, omit for JSON responses 

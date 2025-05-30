@@ -301,7 +301,8 @@ class SAMProcessor:
             obj_id,
             points=points,
             labels=labels,
-            box=box
+            box=box,
+            normalize_coords=False
         )
         return masks.cpu().numpy()
 
@@ -377,11 +378,11 @@ class SAMProcessor:
         try:
             # Add prompt with the right type
             if prompt_type == 'bbox':
-                self.model.add_new_points_or_box(state, frame_idx, obj_id, box=box_tensor)
+                self.model.add_new_points_or_box(state, frame_idx, obj_id, box=box_tensor, normalize_coords=False)
             elif prompt_type == 'points':
-                self.model.add_new_points_or_box(state, frame_idx, obj_id, points=points_tensor, labels=labels_tensor)
+                self.model.add_new_points_or_box(state, frame_idx, obj_id, points=points_tensor, labels=labels_tensor, normalize_coords=False)
             elif prompt_type == 'both':
-                self.model.add_new_points_or_box(state, frame_idx, obj_id, box=box_tensor, points=points_tensor, labels=labels_tensor)
+                self.model.add_new_points_or_box(state, frame_idx, obj_id, box=box_tensor, points=points_tensor, labels=labels_tensor, normalize_coords=False)
             else:
                 logger.error(f"[ERROR] Unknown prompt_type: {prompt_type}")
                 raise ValueError(f"Unknown prompt_type: {prompt_type}")

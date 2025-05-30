@@ -104,6 +104,12 @@ nuke-samurai-server
 nuke-samurai-server --host 0.0.0.0 --port 8000 --log-level info
 ```
 
+or 
+
+```bash
+uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
 ### 4. Verify
 ```bash
 curl http://localhost:8000/api/v1/health

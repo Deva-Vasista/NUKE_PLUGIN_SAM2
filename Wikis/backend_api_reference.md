@@ -3,80 +3,157 @@
 ## Overview
 This backend exposes endpoints for EXR image and sequence segmentation/tracking using SAM2. It supports bounding box and point prompts, multi-object, and multi-frame workflows. All endpoints return robust error messages and support both file and JSON outputs.
 
----
+## Base URL
+```
+http://localhost:8000/api/v1
+```
 
-## 1. `/api/v1/process_exr`
-**POST** — Process a single EXR file with bbox and/or point prompts.
+## Endpoints
 
-### **Request (application/json):**
-- `image_path`: (str, required) — Path to EXR file on disk (must be accessible to backend).
-- `bbox`: (list, optional) — `[x1, y1, x2, y2]`.
-- `points_positive`: (list, optional) — List of `[x, y]` points to select.
-- `points_negative`: (list, optional) — List of `[x, y]` points to remove.
-- `bits`: (str, optional) — Bit depth, default: `32-bit float`.
-- `as_file`: (bool, query param, optional) — If true, returns EXR mask file; else, returns mask as JSON array.
+### 1. Load Model
+```
+POST /models/load
+```
 
-### **Example JSON:**
+Load a specific model type into memory.
+
+Request Body:
 ```json
 {
-  "image_path": "/path/to/frame_0001.exr",
-  "bbox": [454, 185, 500, 633],
-  "points_positive": [[610,728]],
-  "bits": "32-bit float"
+    "model_type": "base"  // One of: "base", "large", "small", "tiny"
 }
 ```
 
-### **Example curl:**
+Response:
+```json
+{
+    "status": "success",
+    "message": "Model loaded successfully",
+    "model_type": "base"
+}
+```
+
+Example:
+```bash
+curl -X POST "http://localhost:8000/api/v1/models/load" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_type": "base"
+  }'
+```
+
+### 2. Process Single Frame
+```
+POST /process_exr
+```
+
+Process a single EXR frame with bounding box and/or point prompts. The model will generate a mask for the selected object.
+
+Query Parameters:
+- `as_file` (boolean): Return mask as EXR file if true, else as list
+
+Request Body:
+```json
+{
+    "image_path": "/path/to/frame.exr",
+    "bbox": [x1, y1, x2, y2],  // Optional: Bounding box coordinates
+    "points_positive": [[x1,y1], [x2,y2]],  // Optional: Points to select
+    "points_negative": [[x1,y1], [x2,y2]],  // Optional: Points to remove
+    "bits": "32-bit float"  // Optional, defaults to "32-bit float"
+}
+```
+
+Example with bbox:
 ```bash
 curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
   -H "Content-Type: application/json" \
   -d '{
-    "image_path": "/path/to/frame_0001.exr",
+    "image_path": "/path/to/frame.exr",
     "bbox": [454, 185, 500, 633],
     "bits": "32-bit float"
   }' \
   --output mask.exr
 ```
 
-### **Response:**
-- If `as_file=true`: EXR mask file.
-- Else: `{ "result": [[...mask array...]] }`
+Example with points:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_path": "/path/to/frame.exr",
+    "points_positive": [[610, 728], [612, 730]],
+    "points_negative": [[500, 500]],
+    "bits": "32-bit float"
+  }' \
+  --output mask.exr
+```
 
-### **Common Problems & Solutions:**
-- **File not found:** Ensure `image_path` is correct and readable by backend.
-- **No prompt provided:** Must provide at least one of `bbox` or `points_positive`/`points_negative`.
-- **Failed to read image:** File is not a valid EXR.
-- **Internal error:** See backend logs for details.
-- **Do not use multipart/form-data:** Only JSON is accepted for this endpoint.
+Example with both bbox and points:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_exr?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_path": "/path/to/frame.exr",
+    "bbox": [454, 185, 500, 633],
+    "points_positive": [[610, 728]],
+    "points_negative": [[500, 500]],
+    "bits": "32-bit float"
+  }' \
+  --output mask.exr
+```
 
----
+### 3. Process Sequence
+```
+POST /process_sequence
+```
 
-## 2. `/api/v1/process_sequence`
-**POST** — Process a sequence of EXR files with multi-object, multi-frame prompts.
+Process a sequence of EXR files with multi-object tracking. The model will track objects across frames and generate masks for each frame.
 
-### **Request (application/json):**
-- `sequence_path`: (str, required) — Path pattern to EXR sequence (e.g., `/path/to/frames/frame_%04d.exr`).
-- `frame_range`: (list, required) — `[start, end]` (inclusive start, exclusive end).
-- `bits`: (str, optional) — Bit depth, default: `32-bit float`.
-- `reverse`: (bool, optional) — Whether to track in reverse time order, default: `false`.
-- `prompts`: (list, required) — List of prompt dicts:
-  - `frame_index`: (int, required) — Frame index (0-based).
-  - `object_id`: (int, optional) — Object ID (defaults to 0 if omitted).
-  - `points_positive`: (list, optional) — List of `[x, y]` points to select.
-  - `points_negative`: (list, optional) — List of `[x, y]` points to remove.
-  - `bbox`: (list, optional) — `[x1, y1, x2, y2]`.
-- `as_file`: (bool, query param, optional) — If true, returns ZIP of EXR masks; else, returns JSON.
+Query Parameters:
+- `as_file` (boolean): Return masks as ZIP if true, else as JSON list
 
-### **Example curl:**
+Request Body:
+```json
+{
+    "sequence_path": "/path/to/frame_%04d.exr",
+    "frame_range": [start_frame, end_frame],
+    "prompts": [
+        {
+            "frame_index": 0,
+            "object_id": 0,
+            "bbox": [x1, y1, x2, y2],  // Optional
+            "points_positive": [[x1,y1]],  // Optional
+            "points_negative": [[x1,y1]]  // Optional
+        }
+    ],
+    "bits": "32-bit float"  // Optional, defaults to "32-bit float"
+}
+```
+
+Example with single object:
 ```bash
 curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
   -H "Content-Type: application/json" \
   -d '{
     "sequence_path": "/path/to/frames/frame_%04d.exr",
     "frame_range": [1, 20],
-    "reverse": false,
     "prompts": [
-      { "frame_index": 0, "bbox": [454, 185, 500, 633] },
+      { "frame_index": 0, "bbox": [454, 185, 500, 633] }
+    ],
+    "bits": "32-bit float"
+  }' \
+  --output masks.zip
+```
+
+Example with multiple objects:
+```bash
+curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sequence_path": "/path/to/frames/frame_%04d.exr",
+    "frame_range": [1, 20],
+    "prompts": [
+      { "frame_index": 0, "object_id": 0, "bbox": [454, 185, 500, 633] },
       { "frame_index": 10, "object_id": 1, "points_positive": [[1689, 216]] }
     ],
     "bits": "32-bit float"
@@ -84,37 +161,185 @@ curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
   --output masks.zip
 ```
 
-### **Response:**
-- If `as_file=true`: ZIP file with EXR masks named `mask_{frame_idx:04d}.exr`.
-- Else: `{ "result": [ {frame_idx: {object_id: mask_array, ...}, ... } ] }`
-
-### **Common Problems & Solutions:**
-- **No prompt provided:** Must provide at least one prompt (bbox or points).
-- **File(s) not found:** Check `sequence_path` and frame numbers.
-- **FPS errors:** Ensure backend sets `original_fps` and `target_fps` (defaults to 24).
-- **Internal error:** See backend logs for details.
-
----
-
-## 3. `/api/v1/models/load`
-**POST** — Load a specific SAM model.
-
-### **Request (application/json):**
-- `model_type`: (str, required) — One of: `large`, `base`, `small`, `tiny`.
-
-### **Example curl:**
+Example with points and bbox:
 ```bash
-curl -X POST "http://localhost:8000/api/v1/models/load" \
+curl -X POST "http://localhost:8000/api/v1/process_sequence?as_file=true" \
   -H "Content-Type: application/json" \
-  -d '{ "model_type": "large" }'
+  -d '{
+    "sequence_path": "/path/to/frames/frame_%04d.exr",
+    "frame_range": [1, 20],
+    "prompts": [
+      { 
+        "frame_index": 0, 
+        "object_id": 0, 
+        "bbox": [454, 185, 500, 633],
+        "points_positive": [[610, 728]],
+        "points_negative": [[500, 500]]
+      }
+    ],
+    "bits": "32-bit float"
+  }' \
+  --output masks.zip
 ```
 
-### **Response:**
-- `{ "status": "success", "model_loaded": "large", "vram_usage": ... }`
+Response:
+```json
+{
+    "status": "success",
+    "task_id": "uuid-string",
+    "output_dir": "Output/uuid-string",
+    "zip_path": "Output/uuid-string/masks_uuid-string.zip",
+    "file_count": 15,
+    "frames": [0, 1, 2, ...]
+}
+```
 
-### **Common Problems & Solutions:**
-- **Model file not found:** Ensure the correct model weights are present in the checkpoints directory.
-- **Invalid model type:** Must be one of the allowed values.
+### 4. Monitor Progress
+```
+WebSocket /ws/{task_id}
+```
+
+Connect to this WebSocket endpoint to receive progress updates:
+```json
+{
+    "progress": 85,
+    "message": "Processing frame 15/16",
+    "status": "running"  // One of: "running", "completed", "failed"
+}
+```
+
+Example using Python:
+```python
+import websockets
+import asyncio
+import json
+
+async def monitor_progress(task_id):
+    uri = f"ws://localhost:8000/api/v1/ws/{task_id}"
+    async with websockets.connect(uri) as websocket:
+        while True:
+            response = await websocket.recv()
+            status = json.loads(response)
+            print(f"Progress: {status['progress']}% - {status['message']}")
+            if status['status'] in ['completed', 'failed']:
+                break
+```
+
+### 5. Get Task Output
+```
+GET /output/{task_id}
+```
+
+Response:
+```json
+{
+    "files": [
+        {
+            "filename": "masks_uuid-string.zip",
+            "size": 1234567,
+            "created": "2024-05-15T12:34:56"
+        }
+    ]
+}
+```
+
+### 6. Download Results
+```
+GET /download/{filename}
+```
+
+Returns the requested file (ZIP or EXR) as a binary response.
+
+Example:
+```bash
+curl -X GET "http://localhost:8000/api/v1/download/masks_uuid-string.zip" \
+  --output masks.zip
+```
+
+### 7. Download All Results
+```
+GET /download_all/{task_id}
+```
+
+Returns a ZIP file containing all output files for the task.
+
+Example:
+```bash
+curl -X GET "http://localhost:8000/api/v1/download_all/uuid-string" \
+  --output all_files.zip
+```
+
+### 8. Get Task Status
+```
+GET /status/{task_id}
+```
+
+Response:
+```json
+{
+    "status": "completed",  // One of: "running", "completed", "failed"
+    "progress": 100,
+    "message": "Processing completed successfully",
+    "error": "Error message if status is failed"  // Optional
+}
+```
+
+### 9. Reset Model State
+```
+POST /reset
+```
+
+Reset the model state, clear GPU memory, and remove any cached data.
+
+Response:
+```json
+{
+    "status": "success",
+    "message": "Model state reset successfully"
+}
+```
+
+### 10. Health Check
+```
+GET /health
+```
+
+Check if the API server is running.
+
+Response:
+```json
+{
+    "status": "healthy",
+    "version": "v1"
+}
+```
+
+## Common Issues and Solutions
+
+1. **File Not Found**
+   - Ensure the image path is correct and accessible to the backend
+   - For Windows paths, they will be automatically converted to WSL paths
+   - Check file permissions
+
+2. **No Prompt Provided**
+   - Must provide at least one of: bbox, points_positive, or points_negative
+   - For sequences, at least one prompt must be provided in the prompts list
+
+3. **Invalid Coordinates**
+   - Coordinates should be within the image dimensions
+   - Bbox format: [x1, y1, x2, y2] where (x1,y1) is top-left and (x2,y2) is bottom-right
+   - Points format: [[x1,y1], [x2,y2], ...]
+
+4. **Memory Issues**
+   - If you encounter GPU memory errors, try:
+     - Using a smaller model (e.g., "small" instead of "large")
+     - Processing smaller frame ranges
+     - Resetting the model state between operations
+
+5. **Output Format**
+   - Single frame: Returns either an EXR file or a JSON array
+   - Sequence: Returns either a ZIP of EXR files or a JSON object with frame indices
+   - Use `as_file=true` to get file outputs, omit for JSON responses
 
 ---
 
