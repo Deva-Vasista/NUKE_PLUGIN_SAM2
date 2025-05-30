@@ -11,7 +11,7 @@ import zipfile
 import time
 
 # API Configuration
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = "http://192.168.12.166:8000"
 API_VERSION = "v1"
 
 class ThreadedTask:
@@ -176,26 +176,36 @@ class Prompt:
     def __init__(self):
         self.frame_index = 0
         self.object_id = 0
-        self.bbox = None
+        self.bboxes = []  # List of bounding boxes instead of single bbox
         self.points_positive = []
         self.points_negative = []
+        self.input_path = None  # Store input path for dimension lookup
 
     def validate_data_types(self):
-        """Ensure all data is in correct types before sending to API"""
-        if self.bbox is not None:
-            # Ensure bbox is a list of float values
-            self.bbox = [float(x) for x in self.bbox]
-            
-        # Convert all points to float values
-        validated_points_positive = []
-        for point in self.points_positive:
-            validated_points_positive.append([float(point[0]), float(point[1])])
-        self.points_positive = validated_points_positive
-        
-        validated_points_negative = []
-        for point in self.points_negative:
-            validated_points_negative.append([float(point[0]), float(point[1])])
-        self.points_negative = validated_points_negative
+        """Ensure all data is in correct types and normalize coordinates"""
+        # Get image dimensions
+        if self.input_path:
+            img = cv2.imread(self.input_path, cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                height, width = img.shape[:2]
+                
+                # # Normalize all bboxes
+                # normalized_bboxes = []
+                # for bbox in self.bboxes:
+                #     normalized_bbox = [
+                #         float(bbox[0]) / width,   # normalized x1
+                #         float(bbox[1]) / height,  # normalized y1
+                #         float(bbox[2]) / width,   # normalized x2
+                #         float(bbox[3]) / height   # normalized y2
+                #     ]
+                #     normalized_bboxes.append(normalized_bbox)
+                # self.bboxes = normalized_bboxes
+                
+                # # Normalize points
+                # self.points_positive = [[float(x)/width, float(y)/height] for x,y in self.points_positive]
+                # self.points_negative = [[float(x)/width, float(y)/height] for x,y in self.points_negative]
+            else:
+                nuke.tprint(f"Warning: Could not read image at {self.input_path} for normalization")
         
         return self
 
@@ -209,6 +219,7 @@ class BoundingBox:
     current_frame = None
     min_frame = None
     max_frame = None
+    current_object_id = 0  # Track current object ID
 
     @classmethod
     def getBbox(cls):
@@ -219,6 +230,7 @@ class BoundingBox:
         cls.min_frame = int(nuke.thisNode().knob('FrameRangeMin').value())
         cls.max_frame = int(nuke.thisNode().knob('FrameRangeMax').value())
         cls.current_frame = cls.min_frame
+        cls.current_object_id = 0  # Initialize current object ID
 
         def get_frame_path(frame_num):
             if "%04d" in input_file_name:
@@ -229,7 +241,7 @@ class BoundingBox:
 
         cls.input_path = get_frame_path(cls.current_frame)
         
-        window_name = "Selection - Left/Right arrows to change frame, Left click and drag for box, 'p' for positive point, 'n' for negative point, 'z' to undo, 'r' to reset, 'q' to finish"
+        window_name = "Selection - Left/Right arrows to change frame, Left click and drag for box, 'p' for positive point, 'n' for negative point, 'z' to undo, 'r' to reset, 'q' to finish, '1-9' to select object ID"
         cv2.namedWindow(window_name, 0)
         cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
         cv2.resizeWindow(window_name, 1280, 720)
@@ -246,27 +258,24 @@ class BoundingBox:
                 if cls.drawing_box:
                     cls.drawing_box = False
                     if cls.current_box[2] > 0 and cls.current_box[3] > 0:
-                        # Get current object ID from node
-                        try:
-                            current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
-                        except:
-                            current_obj_id = 0
                         # Create new prompt or find existing one
                         prompt = None
                         for p in cls.prompts:
-                            if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
+                            if p.frame_index == cls.current_frame and p.object_id == cls.current_object_id:
                                 prompt = p
                                 break
                         if prompt is None:
                             prompt = Prompt()
                             prompt.frame_index = cls.current_frame
-                            prompt.object_id = current_obj_id
+                            prompt.object_id = cls.current_object_id
+                            prompt.input_path = get_frame_path(cls.current_frame)  # Store input path
                             cls.prompts.append(prompt)
-                        # Add bbox to prompt
-                        prompt.bbox = [cls.current_box[0], cls.current_box[1], 
-                                       cls.current_box[0] + cls.current_box[2], 
-                                       cls.current_box[1] + cls.current_box[3]]
-                        nuke.tprint(f"Added box for object {current_obj_id} on frame {cls.current_frame}: {prompt.bbox}")
+                        # Add bbox to prompt's list of bboxes
+                        new_bbox = [cls.current_box[0], cls.current_box[1], 
+                                  cls.current_box[0] + cls.current_box[2], 
+                                  cls.current_box[1] + cls.current_box[3]]
+                        prompt.bboxes.append(new_bbox)
+                        nuke.tprint(f"Added box {len(prompt.bboxes)} for object {cls.current_object_id} on frame {cls.current_frame}: {new_bbox}")
                         cls.current_box = None
 
         # Dictionary to store current mouse position
@@ -282,11 +291,33 @@ class BoundingBox:
             # Draw existing boxes and points for current frame
             for prompt in cls.prompts:
                 if prompt.frame_index == cls.current_frame:
-                    if prompt.bbox:
-                        x1, y1, x2, y2 = prompt.bbox
-                        cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(img_with_boxes, str(prompt.object_id + 1), (x1, y1-5), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    # Draw all bboxes for this prompt
+                    for i, bbox in enumerate(prompt.bboxes):
+                        x1, y1, x2, y2 = bbox
+                        # Use different colors for different object IDs
+                        color = (0, 255, 0)  # Default green
+                        if prompt.object_id == 1:
+                            color = (255, 0, 0)  # Blue
+                        elif prompt.object_id == 2:
+                            color = (0, 0, 255)  # Red
+                        elif prompt.object_id == 3:
+                            color = (255, 255, 0)  # Cyan
+                        elif prompt.object_id == 4:
+                            color = (255, 0, 255)  # Magenta
+                        elif prompt.object_id == 5:
+                            color = (0, 255, 255)  # Yellow
+                        elif prompt.object_id == 6:
+                            color = (128, 0, 0)  # Dark Blue
+                        elif prompt.object_id == 7:
+                            color = (0, 128, 0)  # Dark Green
+                        elif prompt.object_id == 8:
+                            color = (0, 0, 128)  # Dark Red
+                        elif prompt.object_id == 9:
+                            color = (128, 128, 0)  # Dark Yellow
+                        
+                        cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(img_with_boxes, f"{prompt.object_id}.{i+1}", (x1, y1-5), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                     
                     for point in prompt.points_positive:
                         cv2.circle(img_with_boxes, point, 5, (0, 255, 0), -1)
@@ -301,11 +332,31 @@ class BoundingBox:
             # Draw current box being drawn
             if cls.drawing_box and cls.current_box:
                 x, y, w, h = cls.current_box
-                cv2.rectangle(img_with_boxes, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                # Use color based on current object ID
+                color = (0, 255, 0)  # Default green
+                if cls.current_object_id == 1:
+                    color = (255, 0, 0)  # Blue
+                elif cls.current_object_id == 2:
+                    color = (0, 0, 255)  # Red
+                elif cls.current_object_id == 3:
+                    color = (255, 255, 0)  # Cyan
+                elif cls.current_object_id == 4:
+                    color = (255, 0, 255)  # Magenta
+                elif cls.current_object_id == 5:
+                    color = (0, 255, 255)  # Yellow
+                elif cls.current_object_id == 6:
+                    color = (128, 0, 0)  # Dark Blue
+                elif cls.current_object_id == 7:
+                    color = (0, 128, 0)  # Dark Green
+                elif cls.current_object_id == 8:
+                    color = (0, 0, 128)  # Dark Red
+                elif cls.current_object_id == 9:
+                    color = (128, 128, 0)  # Dark Yellow
+                cv2.rectangle(img_with_boxes, (x, y), (x + w, y + h), color, 2)
 
             # Create a semi-transparent overlay for better text visibility
             overlay = img_with_boxes.copy()
-            cv2.rectangle(overlay, (0, 0), (400, 350), (0, 0, 0), -1)
+            cv2.rectangle(overlay, (0, 0), (400, 400), (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.7, img_with_boxes, 0.3, 0, img_with_boxes)
 
             # Show instructions
@@ -323,20 +374,24 @@ class BoundingBox:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.putText(img_with_boxes, "Press 'q' to finish", (10, 210), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(img_with_boxes, "Press '1-9' to select object ID", (10, 240), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
             # Show current frame and selection counts
             current_prompts = [p for p in cls.prompts if p.frame_index == cls.current_frame]
-            boxes_count = sum(1 for p in current_prompts if p.bbox)
+            boxes_count = sum(len(p.bboxes) for p in current_prompts)
             pos_points = sum(len(p.points_positive) for p in current_prompts)
             neg_points = sum(len(p.points_negative) for p in current_prompts)
 
-            cv2.putText(img_with_boxes, f"Current Frame: {cls.current_frame}", (10, 250), 
+            cv2.putText(img_with_boxes, f"Current Frame: {cls.current_frame}", (10, 280), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, f"Boxes: {boxes_count}", (10, 280), 
+            cv2.putText(img_with_boxes, f"Current Object ID: {cls.current_object_id}", (10, 310), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, f"Positive points: {pos_points}", (10, 310), 
+            cv2.putText(img_with_boxes, f"Boxes: {boxes_count}", (10, 340), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img_with_boxes, f"Negative points: {neg_points}", (10, 340), 
+            cv2.putText(img_with_boxes, f"Positive points: {pos_points}", (10, 370), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(img_with_boxes, f"Negative points: {neg_points}", (10, 400), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
             cv2.imshow(window_name, img_with_boxes)
@@ -362,52 +417,58 @@ class BoundingBox:
             elif key == ord('z'):  # Press 'z' to undo
                 current_prompts = [p for p in cls.prompts if p.frame_index == cls.current_frame]
                 if current_prompts:
-                    cls.prompts.remove(current_prompts[-1])
-                    nuke.tprint(f"Undid last selection on frame {cls.current_frame}")
+                    # Find the last prompt with boxes
+                    last_prompt = None
+                    for p in reversed(current_prompts):
+                        if p.bboxes:
+                            last_prompt = p
+                            break
+                    
+                    if last_prompt:
+                        # Remove the last box from the last prompt
+                        last_prompt.bboxes.pop()
+                        nuke.tprint(f"Undid last box for object {last_prompt.object_id} on frame {cls.current_frame}")
+                        # If no boxes left, remove the prompt
+                        if not last_prompt.bboxes and not last_prompt.points_positive and not last_prompt.points_negative:
+                            cls.prompts.remove(last_prompt)
+                    else:
+                        # If no boxes, remove the last prompt
+                        cls.prompts.remove(current_prompts[-1])
+                        nuke.tprint(f"Undid last selection on frame {cls.current_frame}")
             
             elif key == ord('p'):  # Press 'p' to add positive point
                 x, y = mouse_pos['current_pos']
-                # Get current object ID from node
-                try:
-                    current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
-                except:
-                    current_obj_id = 0
                 # Create new prompt or find existing one
                 prompt = None
                 for p in cls.prompts:
-                    if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
+                    if p.frame_index == cls.current_frame and p.object_id == cls.current_object_id:
                         prompt = p
                         break
                 if prompt is None:
                     prompt = Prompt()
                     prompt.frame_index = cls.current_frame
-                    prompt.object_id = current_obj_id
+                    prompt.object_id = cls.current_object_id
                     cls.prompts.append(prompt)
                 # Add point to prompt
                 prompt.points_positive.append([x, y])
-                nuke.tprint(f"Added positive point for object {current_obj_id} on frame {cls.current_frame}: {x = }, {y = }")
+                nuke.tprint(f"Added positive point for object {cls.current_object_id} on frame {cls.current_frame}: {x = }, {y = }")
             
             elif key == ord('n'):  # Press 'n' to add negative point
                 x, y = mouse_pos['current_pos']
-                # Get current object ID from node
-                try:
-                    current_obj_id = int(nuke.thisNode().knob('CurrentObjectID').value())
-                except:
-                    current_obj_id = 0
                 # Create new prompt or find existing one
                 prompt = None
                 for p in cls.prompts:
-                    if p.frame_index == cls.current_frame and p.object_id == current_obj_id:
+                    if p.frame_index == cls.current_frame and p.object_id == cls.current_object_id:
                         prompt = p
                         break
                 if prompt is None:
                     prompt = Prompt()
                     prompt.frame_index = cls.current_frame
-                    prompt.object_id = current_obj_id
+                    prompt.object_id = cls.current_object_id
                     cls.prompts.append(prompt)
                 # Add point to prompt
                 prompt.points_negative.append([x, y])
-                nuke.tprint(f"Added negative point for object {current_obj_id} on frame {cls.current_frame}: {x = }, {y = }")
+                nuke.tprint(f"Added negative point for object {cls.current_object_id} on frame {cls.current_frame}: {x = }, {y = }")
             
             elif key == 83 or key == 100:  # Right arrow key (→)
                 if cls.current_frame < cls.max_frame:
@@ -418,6 +479,15 @@ class BoundingBox:
                 if cls.current_frame > cls.min_frame:
                     cls.current_frame -= 1
                     nuke.tprint(f"Moving to frame {cls.current_frame}")
+            
+            elif ord('1') <= key <= ord('9'):  # Number keys 1-9
+                cls.current_object_id = key - ord('0')  # Convert key to 1-9
+                nuke.tprint(f"Selected object ID: {cls.current_object_id}")
+                # Update the node's CurrentObjectID knob
+                try:
+                    nuke.thisNode().knob('CurrentObjectID').setValue(cls.current_object_id)
+                except:
+                    pass
 
         cv2.destroyWindow(window_name)
 
@@ -440,7 +510,17 @@ class BoundingBox:
                 nuke.tprint("ERROR: PromptsList knob not found on node")
                 return cls.prompts
                 
-            prompts_json = json.dumps([p.__dict__ for p in cls.prompts])
+            prompts_json = json.dumps([
+                {
+                    "frame_index": p.frame_index,
+                    "object_id": p.object_id,
+                    "bbox": p.bboxes[0] if p.bboxes else None,
+                    "points_positive": p.points_positive,
+                    "points_negative": p.points_negative,
+                    "input_path": p.input_path
+                }
+                for p in cls.prompts
+            ])
             prompts_knob.setValue(prompts_json)
             nuke.tprint(f"Successfully updated PromptsList with {len(cls.prompts)} prompts")
             
@@ -466,22 +546,29 @@ class BoundingBox:
             prompt_dict = {
                 "frame_index": prompt.frame_index,
                 "object_id": prompt.object_id,
-                "bbox": prompt.bbox,
+                "bbox": prompt.bboxes[0] if prompt.bboxes else None,  # Send first bbox if exists
                 "points_positive": prompt.points_positive,
                 "points_negative": prompt.points_negative
             }
             prompts_data.append(prompt_dict)
 
-        # Send data to API
+        # Convert paths for API
         try:
+            video_path = convert_windows_to_linux_path(nuke.thisNode().knob('FilePath').value())
+            video_output_path = convert_windows_to_linux_path(nuke.thisNode().knob('OutputPath').getValue())
+            
+            # Send data to API
             response = requests.post(
                 f"{API_BASE_URL}/api/{API_VERSION}/process_exr",
-                json={"prompts": prompts_data}
+                json={
+                    "prompts": prompts_data,
+                    "sequence_path": video_path,
+                    "output_path": video_output_path
+                }
             )
             response.raise_for_status()
             result = response.json()
             nuke.tprint(f"API response: {result}")
-            # TODO: Handle the result (e.g., create mask nodes in Nuke)
         except Exception as e:
             nuke.tprint(f"Error sending prompts to API: {str(e)}")
 
@@ -583,6 +670,48 @@ def normalize_path(path):
         normalized = normalized.replace('//', '/')
     return normalized
 
+def convert_windows_to_linux_path(windows_path):
+    """Convert Windows network path to Linux path format"""
+    # Remove any @ symbol if present
+    path = windows_path.lstrip('@')
+    
+    # Convert backslashes to forward slashes
+    path = path.replace('\\', '/')
+    
+    # Handle network paths (\\server\share\path)
+    if path.startswith('//'):
+        # Remove the leading // and split into parts
+        parts = path[2:].split('/')
+        if len(parts) >= 2:
+            server = parts[0]
+            share = parts[1]
+            # Convert to /mnt/share format
+            return f"/mnt/shared/{'/'.join(parts[2:])}"
+    
+    # Handle local Windows paths (e.g., D:/path)
+    if ':' in path:
+        # Convert drive letter path to network share path
+        drive, rest = path.split(':', 1)
+        # Remove leading slash if present
+        rest = rest.lstrip('/')
+        # Convert to network share format
+        return f"/mnt/shared/{rest}"
+    
+    return path
+
+def convert_linux_to_windows_path(linux_path):
+    """Convert Linux path to Windows network path format"""
+    # Handle /mnt/share paths
+    if linux_path.startswith('/mnt/'):
+        parts = linux_path.split('/')
+        if len(parts) >= 3:
+            share = parts[2]
+            # Convert to \\server\share format using raw string for backslashes
+            remaining_path = '\\'.join(parts[3:])
+            return f"\\\\192.168.12.166\\SharedData\\{remaining_path}"
+    
+    return linux_path
+
 def GenerateMask():
     # Upgrade the node if needed (for backwards compatibility)
     upgrade_node_if_needed()
@@ -616,8 +745,8 @@ def GenerateMask():
     update_status_safely("Starting processing...")
     
     # Get all required parameters
-    video_path = nuke.thisNode().knob('FilePath').value()
-    video_output_path = nuke.thisNode().knob('OutputPath').getValue()
+    video_path = convert_windows_to_linux_path(nuke.thisNode().knob('FilePath').value())
+    video_output_path = convert_windows_to_linux_path(nuke.thisNode().knob('OutputPath').getValue())
     save_to_file = nuke.thisNode().knob('FileType').value()
     frame_range = [int(nuke.thisNode().knob('FrameRangeMin').value()),
                   int(nuke.thisNode().knob('FrameRangeMax').value() + 1)]
@@ -651,7 +780,16 @@ def GenerateMask():
         # Validate all prompts to ensure correct data types
         validated_prompts = []
         for prompt in BoundingBox.prompts:
-            validated_prompts.append(prompt.validate_data_types().__dict__)
+            # Validate data types before sending
+            prompt.validate_data_types()
+            prompt_dict = {
+                "frame_index": prompt.frame_index,
+                "object_id": prompt.object_id,
+                "bbox": prompt.bboxes[0] if prompt.bboxes else None,  # Send first bbox if exists
+                "points_positive": prompt.points_positive,
+                "points_negative": prompt.points_negative
+            }
+            validated_prompts.append(prompt_dict)
         
         request_data = {
             "sequence_path": video_path,
@@ -659,12 +797,14 @@ def GenerateMask():
             "prompts": validated_prompts,
             "bits": bits,
             "original_fps": original_fps,
-            "target_fps": target_fps,
-            "reverse": False  # Always set to False since we removed the UI option
+            "target_fps": target_fps
         }
 
         nuke.tprint("Sending sequence to API for processing...")
+        nuke.tprint(f"Using paths - Input: {video_path}")
+        nuke.tprint(f"Request data: {json.dumps(request_data, indent=2)}")  # Debug print
         
+        # Send request to process_sequence endpoint
         response = requests.post(
             f"{API_BASE_URL}/api/{API_VERSION}/process_sequence?as_file=true",
             json=request_data,
