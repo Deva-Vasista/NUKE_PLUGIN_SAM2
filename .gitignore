@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+bks/*
 *.py[cod]
 *$py.class
 Docker_plugin/NukeSamurai/sam2_repo/checkpoints/*.pt

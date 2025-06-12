@@ -20,6 +20,7 @@ class ProcessSequenceRequest(BaseModel):
     original_fps: float = Field(24.0, description="Original frames per second")
     target_fps: float = Field(24.0, description="Target frames per second")
     bits: int = Field(32, description="Bit depth of the EXR files (8, 16, or 32)")
+    dimensions: Optional[Tuple[int, int]] = Field(None, description="Expected image dimensions (width, height)")
 
 class ProcessEXRRequest(BaseModel):
     image_path: str
@@ -27,6 +28,7 @@ class ProcessEXRRequest(BaseModel):
     points_positive: Optional[List[List[float]]] = Field(None, description="List of positive points [[x1, y1], [x2, y2], ...]")
     points_negative: Optional[List[List[float]]] = Field(None, description="List of negative points [[x1, y1], [x2, y2], ...]")
     bits: Literal["8-bit integer", "16-bit integer", "32-bit float"] = Field("32-bit float", description="Bit depth format")
+    dimensions: Optional[Tuple[int, int]] = Field(None, description="Expected image dimensions (width, height)")
 
 class ModelLoadRequest(BaseModel):
     model_type: Literal["large", "base-plus", "small", "tiny"] = Field(..., description="Type of SAM2 model to load")

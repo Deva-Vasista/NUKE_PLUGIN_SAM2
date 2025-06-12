@@ -5,10 +5,15 @@ import torch
 import sys
 import os
 import json
+import warnings
 from loguru import logger
 from src.routes import exr, models, health, gpu, batch
 from src.utils.gpu_manager import GPUManager, GPUMemoryError
 from src.utils.json_utils import ensure_serializable
+import asyncio
+import gc
+import multiprocessing
+import atexit
 
 # Add the project root to the Python path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +21,54 @@ sys.path.append(project_root)
 
 # Enable OpenEXR support in OpenCV
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", message="Memory efficient kernel not used because")
+warnings.filterwarnings("ignore", message="Memory Efficient attention has been runtime disabled")
+warnings.filterwarnings("ignore", message="Flash attention kernel not used because")
+warnings.filterwarnings("ignore", message="Expected query, key and value to all be of dtype")
+warnings.filterwarnings("ignore", message="CuDNN attention kernel not used because")
+warnings.filterwarnings("ignore", message="Flash Attention kernel failed due to")
+warnings.filterwarnings("ignore", message="cannot import name '_C' from 'sam2'")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.module")
+warnings.filterwarnings("ignore", message=".*preferred_linalg_library.*")
+warnings.filterwarnings("ignore", message="torch.cuda.amp.autocast.*is deprecated")
+warnings.filterwarnings("ignore", message="torch.set_default_tensor_type.*is deprecated")
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.cuda.amp.autocast.*")
+warnings.filterwarnings("ignore", category=Warning, message=".*W612.*")
+# Suppress multiprocessing resource tracker warning
+warnings.filterwarnings("ignore", category=UserWarning, module="multiprocessing.resource_tracker")
+
+# Initialize GPU manager at module level
+gpu_manager = GPUManager()
+
+def cleanup_resources():
+    """Clean up resources before server shutdown."""
+    try:
+        # Clear GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        # Clean up multiprocessing resources
+        if hasattr(multiprocessing, 'resource_tracker'):
+            # Get the resource tracker
+            tracker = multiprocessing.resource_tracker._resource_tracker
+            # Close all tracked resources
+            for name in list(tracker._resources.keys()):
+                try:
+                    tracker.unregister(name, 'fd')
+                except:
+                    pass
+            # Clear the internal dictionary
+            tracker._resources.clear()
+            
+        logger.info("Resources cleaned up successfully")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+
+# Register cleanup function
+atexit.register(cleanup_resources)
 
 # Monkeypatch nuke.tprint, nuke.ProgressTask, and common stubs for environments without real Nuke
 try:
@@ -142,9 +195,28 @@ async def gpu_memory_middleware(request: Request, call_next):
     try:
         if torch.cuda.is_available():
             gpu_manager = GPUManager()
+            # Check memory before processing request
             await gpu_manager.ensure_memory()
-        return await call_next(request)
+            
+            # Log memory stats
+            stats = gpu_manager.get_memory_stats()
+            logger.info(f"GPU Memory before request: {stats}")
+            
+            response = await call_next(request)
+            
+            # Log memory stats after request
+            stats = gpu_manager.get_memory_stats()
+            logger.info(f"GPU Memory after request: {stats}")
+            
+            # If memory usage is high, trigger cleanup
+            if stats["usage_percent"] > 80:
+                logger.warning("High GPU memory usage detected, triggering cleanup")
+                gpu_manager.clear_cache()
+                gc.collect()
+            
+            return response
     except GPUMemoryError as e:
+        logger.error(f"GPU Memory error: {str(e)}")
         return JSONResponse(
             status_code=503,
             content={"error": str(e)},
@@ -185,6 +257,23 @@ async def gpu_memory_error_handler(request: Request, exc: GPUMemoryError):
         content={"error": str(exc)},
         headers={"Retry-After": "5"}
     )
+
+# Add periodic memory cleanup task
+async def periodic_memory_cleanup():
+    """Periodically check and clean up GPU memory."""
+    while True:
+        try:
+            if torch.cuda.is_available():
+                stats = gpu_manager.get_memory_stats()
+                if stats["usage_percent"] > 70:  # If memory usage is above 70%
+                    logger.warning("Periodic cleanup: High GPU memory usage detected")
+                    gpu_manager.clear_cache()
+                    gc.collect()
+                    logger.info("Periodic cleanup completed")
+            await asyncio.sleep(300)  # Check every 5 minutes
+        except Exception as e:
+            logger.error(f"Error in periodic memory cleanup: {e}")
+            await asyncio.sleep(60)  # Wait a minute before retrying
 
 @app.on_event("startup")
 async def startup_event():
@@ -283,6 +372,10 @@ async def startup_event():
     torch.set_default_dtype(torch.float32)
     logger.info("Set default dtype to float32")
     
+    # Start periodic memory cleanup task
+    asyncio.create_task(periodic_memory_cleanup())
+    logger.info("Started periodic memory cleanup task")
+    
     # Initialize GPU
     if torch.cuda.is_available():
         logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
@@ -298,6 +391,11 @@ async def startup_event():
         logger.info("Disabled mixed precision and TF32 for consistent float32 operations")
     else:
         logger.warning("No GPU available, running in CPU mode")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources on server shutdown."""
+    cleanup_resources()
 
 if __name__ == "__main__":
     import uvicorn

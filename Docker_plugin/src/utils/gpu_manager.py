@@ -23,6 +23,8 @@ class GPUManager:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.min_free_memory = 2 * 1024**3  # 2GB minimum free memory
         self.initialized = True
+        self.last_cleanup_time = 0
+        self.cleanup_cooldown = 60  # seconds between cleanups
     
     def get_free_memory(self) -> int:
         """Get free GPU memory in bytes."""
@@ -70,9 +72,43 @@ class GPUManager:
     
     def clear_cache(self):
         """Clear GPU cache and garbage collect."""
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if not torch.cuda.is_available():
+            return
+            
+        # Log memory stats before cleanup
+        stats_before = self.get_memory_stats()
+        logger.info(f"Memory before cleanup: {stats_before}")
+        
+        # Clear PyTorch cache
+        torch.cuda.empty_cache()
+        
+        # Clear CUDA cache
+        if hasattr(torch.cuda, 'memory_summary'):
+            torch.cuda.memory_summary(device=None, abbreviated=True)
+        
+        # Force garbage collection
         gc.collect()
+        
+        # Clear any cached tensors
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj):
+                    if obj.device.type == 'cuda':
+                        del obj
+            except:
+                pass
+        
+        # Force another garbage collection
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Log memory stats after cleanup
+        stats_after = self.get_memory_stats()
+        logger.info(f"Memory after cleanup: {stats_after}")
+        
+        # Calculate memory freed
+        freed_gb = (stats_before['used_gb'] - stats_after['used_gb'])
+        logger.info(f"Freed {freed_gb:.2f}GB of GPU memory")
     
     def get_memory_stats(self) -> dict:
         """Get detailed memory statistics."""
@@ -86,7 +122,9 @@ class GPUManager:
             "total_gb": total / 1024**3,
             "used_gb": used / 1024**3,
             "free_gb": free / 1024**3,
-            "usage_percent": (used / total) * 100
+            "usage_percent": (used / total) * 100,
+            "max_allocated_gb": torch.cuda.max_memory_allocated() / 1024**3,
+            "max_reserved_gb": torch.cuda.max_memory_reserved() / 1024**3
         }
     
     def is_gpu_available(self) -> bool:

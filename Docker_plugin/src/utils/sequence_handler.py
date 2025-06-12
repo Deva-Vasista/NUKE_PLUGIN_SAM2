@@ -6,6 +6,7 @@ import torch
 from pathlib import Path
 from typing import List, Tuple, Optional
 from loguru import logger
+from tqdm import tqdm
 
 class EXRSequenceHandler:
     def __init__(
@@ -55,6 +56,11 @@ class EXRSequenceHandler:
     def _get_frame_paths(self) -> List[str]:
         """Get all frame paths in the sequence within the specified range."""
         frame_paths = []
+        total_frames = self.frame_range_max - self.frame_range_min + 1
+        
+        # Create progress bar
+        pbar = tqdm(total=total_frames, desc="Scanning sequence", unit="frames")
+        
         for frame_num in range(self.frame_range_min, self.frame_range_max + 1):
             # Format frame number with correct padding
             if self.frame_pattern == "%04d":
@@ -66,6 +72,11 @@ class EXRSequenceHandler:
             frame_path = self.sequence_path.replace(self.frame_pattern, padded_frame)
             if os.path.exists(frame_path):
                 frame_paths.append(frame_path)
+            
+            # Update progress
+            pbar.update(1)
+            
+        pbar.close()
         return sorted(frame_paths)
     
     def read_frame(self, frame_path: str) -> torch.Tensor:

@@ -20,7 +20,7 @@ services:
       # Enable OpenEXR support in OpenCV
       - OPENCV_IO_ENABLE_OPENEXR=1
     volumes:
-      - /media/ptgml/ptg/vasista/NUKE_PLUGIN_SAM2/Downloads/frames/output_dir:/data
+      - /mnt/PTGData/shared:/mnt/PTGData/shared
     deploy:
       resources:
         reservations:
@@ -30,7 +30,7 @@ services:
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
-      interval: 30s
+      interval: 200s
       timeout: 10s
       retries: 3
       start_period: 10s
@@ -51,5 +51,7 @@ services:
       - DEBUG=${DEBUG:-false}
       - SAM2_BUILD_CUDA=0
       - OPENCV_IO_ENABLE_OPENEXR=1
+    volumes:
+      - /mnt/PTGData/shared:/mnt/PTGData/shared
     profiles: ["cpu"]
     command: ["--host", "0.0.0.0", "--port", "8000"] 

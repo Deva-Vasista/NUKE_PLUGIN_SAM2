@@ -7,6 +7,7 @@ import asyncio
 import re
 from collections.abc import Mapping, Sequence
 import functools
+import cv2
 
 # Global patches for tensor operations to avoid BFloat16 issues
 def patch_torch_operations():
@@ -226,12 +227,27 @@ class SAMProcessor:
         
         return state, images, frame_start
         
-    def generate_mask(self, image, bbox=None, points_positive=None, points_negative=None, frame_range=None, original_fps=24, target_fps=24, bits=32):
+    def generate_mask(self, image, bbox=None, points_positive=None, points_negative=None, frame_range=None, original_fps=24, target_fps=24, bits=32, dimensions=None):
         """
         Generate a mask for a single image using bbox and/or positive/negative points.
         """
         if self.model is None:
             raise RuntimeError("No model loaded")
+            
+        # Log input dimensions
+        height, width = image.shape[:2]
+        logger.info(f"Input image dimensions: {width}x{height}")
+        
+        # Check and handle dimension mismatch if expected dimensions are provided
+        if dimensions is not None:
+            expected_width, expected_height = dimensions
+            logger.info(f"Expected dimensions: {expected_width}x{expected_height}")
+            if (width, height) != (expected_width, expected_height):
+                logger.warning(f"Dimension mismatch: Expected {expected_width}x{expected_height}, got {width}x{height}")
+                # Resize image to match expected dimensions
+                image = cv2.resize(image, (expected_width, expected_height), interpolation=cv2.INTER_LINEAR)
+                logger.info(f"Resized image to {expected_width}x{expected_height}")
+        
         # If the model is a mock (for tests), use .predict()
         if hasattr(self.model, "predict"):
             input_kwargs = {}
@@ -242,6 +258,7 @@ class SAMProcessor:
             if points_negative is not None:
                 input_kwargs['points_negative'] = points_negative
             return self.model.predict(image, **input_kwargs)
+            
         # --- Real model logic for single EXR file ---
         # Prepare image as torch tensor
         img = torch.from_numpy(image).float()
@@ -249,206 +266,86 @@ class SAMProcessor:
             img = img.unsqueeze(2)
         if img.shape[-1] == 1:
             img = img.repeat(1, 1, 3)
-        if img.shape[-1] == 3:
-            img = img.permute(2, 0, 1)  # HWC to CHW
-        img = img.unsqueeze(0)  # Add batch dimension
-        img = img / 255.0 if img.max() > 1.0 else img
+        img = img.permute(2, 0, 1).unsqueeze(0)
         img = img.to(self.device)
-        # Create dummy inference state
-        inference_state = {
-            "images": img,
-            "num_frames": 1,
-            "offload_video_to_cpu": False,
-            "offload_state_to_cpu": False,
-            "video_height": img.shape[2],
-            "video_width": img.shape[3],
-            "device": self.device,
-            "storage_device": self.device,
-            "point_inputs_per_obj": {},
-            "mask_inputs_per_obj": {},
-            "cached_features": {},
-            "constants": {},
-            "obj_id_to_idx": {},
-            "obj_idx_to_id": {},
-            "obj_ids": [],
-            "output_dict": {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}},
-            "output_dict_per_obj": {},
-            "temp_output_dict_per_obj": {},
-            "consolidated_frame_inds": {"cond_frame_outputs": set(), "non_cond_frame_outputs": set()},
-            "tracking_has_started": False,
-            "frames_already_tracked": {},
-        }
-        frame_idx = 0
-        obj_id = 0
-        # Prepare points and labels
-        points = []
-        labels = []
-        if points_positive is not None:
-            for pt in points_positive:
-                points.append(pt)
-                labels.append(1)
-        if points_negative is not None:
-            for pt in points_negative:
-                points.append(pt)
-                labels.append(0)
-        points = torch.tensor(points, dtype=torch.float32) if points else None
-        labels = torch.tensor(labels, dtype=torch.int32) if labels else None
-        box = torch.tensor(bbox, dtype=torch.float32) if bbox is not None else None
-        # Call add_new_points_or_box
-        _, _, masks = self.model.add_new_points_or_box(
-            inference_state,
-            frame_idx,
-            obj_id,
-            points=points,
-            labels=labels,
-            box=box,
-            normalize_coords=False
-        )
-        return masks.cpu().numpy()
-
-    async def generate_mask_async(self, image, bbox=None, points_positive=None, points_negative=None, frame_range=None, original_fps=24, target_fps=24, bits=32):
-        """
-        Asynchronously generate a mask for a single image using bbox and/or positive/negative points.
-        """
-        if self.model is None:
-            raise RuntimeError("No model loaded")
-        # Await the sync version in a thread pool
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.generate_mask, image, bbox, points_positive, points_negative, frame_range, original_fps, target_fps, bits)
-
-    def track_sequence(self, sequence_path, frame_range, bbox=None, points_positive=None, points_negative=None, original_fps=24, target_fps=24, bits=32, debug=False):
-        """
-        Track an object in a sequence using bbox and/or positive/negative points, returning a list of masks (one per frame).
-        """
-        if self.model is None:
-            raise RuntimeError("No model loaded")
-        # If the model is a mock (for tests), just call generate_mask for each frame
-        if hasattr(self.model, "predict"):
-            num_frames = frame_range[1] - frame_range[0] + 1
-            dummy_img = np.ones((256, 256, 3), dtype=np.float32)
-            return [self.generate_mask(dummy_img, bbox, points_positive, points_negative) for _ in range(num_frames)]
-        # --- Real model logic ---
-        try:
-            # Convert Windows path to WSL path if needed
-            sequence_path = self._convert_windows_to_wsl_path(sequence_path)
-            
-            # Use patched init_state to handle paths
-            state, images, frame_start = self.patched_init_state(
-                sequence_path,
-                frame_range_min=frame_range[0],
-                frame_range_max=frame_range[1],
-                    original_fps=original_fps,
-                    target_fps=target_fps,
-                    bits=bits
-                )
-        except Exception as e:
-            logger.error(f"[ERROR] Model init_state failed: {e}")
-            raise
-        frame_idx = 0  # always add prompts to first frame
-        obj_id = 0
-        # Prepare points and labels
-        points = []
-        labels = []
-        if points_positive is not None:
-            for pt in points_positive:
-                points.append(pt)
-                labels.append(1)
-        if points_negative is not None:
-            for pt in points_negative:
-                points.append(pt)
-                labels.append(0)
-        prompt_type = None
-        if bbox is not None and (points_positive or points_negative):
-            prompt_type = 'both'
-        elif bbox is not None:
-            prompt_type = 'bbox'
-        elif points_positive or points_negative:
-            prompt_type = 'points'
-        else:
-            logger.error("[ERROR] No valid prompt provided: must provide bbox and/or points.")
-            raise ValueError("Must provide at least bbox or points.")
-        if debug:
-            logger.info(f"[DEBUG] Adding prompt: {prompt_type}")
-            
-        # Make sure tensors are float32
-        points_tensor = torch.tensor(points, dtype=torch.float32) if points else None
-        labels_tensor = torch.tensor(labels, dtype=torch.int32) if labels else None
-        box_tensor = torch.tensor(bbox, dtype=torch.float32) if bbox is not None else None
         
-        try:
-            # Add prompt with the right type
-            if prompt_type == 'bbox':
-                self.model.add_new_points_or_box(state, frame_idx, obj_id, box=box_tensor, normalize_coords=False)
-            elif prompt_type == 'points':
-                self.model.add_new_points_or_box(state, frame_idx, obj_id, points=points_tensor, labels=labels_tensor, normalize_coords=False)
-            elif prompt_type == 'both':
-                self.model.add_new_points_or_box(state, frame_idx, obj_id, box=box_tensor, points=points_tensor, labels=labels_tensor, normalize_coords=False)
-            else:
-                logger.error(f"[ERROR] Unknown prompt_type: {prompt_type}")
-                raise ValueError(f"Unknown prompt_type: {prompt_type}")
-                
-            # Make sure state tensors are float32 after adding prompt
-            with torch.no_grad():
-                state = self._convert_tensors_to_float32(state)
-                
-        except Exception as e:
-            logger.error(f"[ERROR] add_new_points_or_box failed: {e}")
-            raise
+        # Generate mask
+        with torch.inference_mode():
+            mask = self.model.predict(img, bbox, points_positive, points_negative)
             
-        # Debug logging
-        if debug:
-            logger.info(f"[DEBUG] propagate_in_video: state type={type(state)}, frame_start={frame_start}, frame_range={frame_range}, images shape={getattr(images, 'shape', None)}")
-            logger.info(f"[DEBUG] state keys: {list(state.keys())}")
-            logger.info(f"[DEBUG] state['images'] shape: {getattr(state.get('images', None), 'shape', None)}")
-            logger.info(f"[DEBUG] state['num_frames']: {state.get('num_frames', None)}")
+        # Convert mask to numpy and ensure it matches input dimensions
+        mask = mask.squeeze().cpu().numpy()
+        if dimensions is not None:
+            expected_width, expected_height = dimensions
+            if mask.shape != (expected_height, expected_width):
+                logger.warning(f"Resizing output mask to match expected dimensions {expected_width}x{expected_height}")
+                mask = cv2.resize(mask, (expected_width, expected_height), interpolation=cv2.INTER_LINEAR)
+        
+        return mask
+
+    async def generate_mask_async(self, image, bbox=None, points_positive=None, points_negative=None, frame_range=None, original_fps=24, target_fps=24, bits=32, dimensions=None):
+        """Async wrapper for generate_mask"""
+        return await asyncio.to_thread(
+            self.generate_mask,
+            image,
+            bbox,
+            points_positive,
+            points_negative,
+            frame_range,
+            original_fps,
+            target_fps,
+            bits,
+            dimensions
+        )
+
+    def track_sequence(self, sequence_path, frame_range, bbox=None, points_positive=None, points_negative=None, original_fps=24, target_fps=24, bits=32, debug=False, dimensions=None):
+        """
+        Track objects in a sequence of frames using SAM2.
+        """
+        if self.model is None:
+            raise RuntimeError("No model loaded")
             
-        # Propagate masks
-        masks_list = []
-        try:
-            # Create a wrapper to convert tensors during propagation
-            def propagate_with_conversion():
-                for idx, (frame_idx, object_ids, masks) in enumerate(self.model.propagate_in_video(
-                    state,
-                    start_frame_idx=frame_start,
-                    max_frame_num_to_track=frame_range[1] - frame_range[0] + 1
-                )):
-                    # Ensure masks are float32 before yielding
-                    if masks.dtype != torch.float32:
-                        masks = masks.to(torch.float32)
-                    if debug:
-                        logger.info(f"[DEBUG] propagate_in_video yielded idx={idx}, masks type={type(masks)}, shape={getattr(masks, 'shape', None)}, dtype={masks.dtype}")
-                    masks_list.append(masks.cpu().numpy())
-                    yield frame_idx, object_ids, masks
-            # Apply the conversion during propagation
-            for _ in propagate_with_conversion():
-                pass
-        except RuntimeError as e:
-            if "expected scalar type Float but found BFloat16" in str(e):
-                logger.error(f"[ERROR] Data type mismatch (BFloat16 vs Float): {e}")
-                logger.info("[INFO] Attempting to recover by forcing model components to float32...")
-                # If we got here, try a last resort recovery
-                try:
-                    for module in self.model.modules():
-                        for param in module.parameters():
-                            if param.dtype != torch.float32:
-                                param.data = param.data.to(torch.float32)
-                    # Try propagation again
-                    for idx, (_, _, masks) in enumerate(self.model.propagate_in_video(
-                        state,
-                        start_frame_idx=frame_start,
-                        max_frame_num_to_track=frame_range[1] - frame_range[0] + 1
-                    )):
-                        masks_list.append(masks.cpu().numpy())
-                except Exception as recovery_e:
-                    logger.error(f"[ERROR] Recovery attempt failed: {recovery_e}")
-                    raise
-            else:
-                logger.error(f"[ERROR] propagate_in_video failed: {e}")
-                raise
-        except Exception as e:
-            logger.error(f"[ERROR] propagate_in_video failed: {e}")
-            raise
-        return masks_list
+        # Convert Windows path to WSL path if needed
+        sequence_path = self._convert_windows_to_wsl_path(sequence_path)
+        
+        # Initialize state and get first frame
+        state, images, frame_start = self.patched_init_state(sequence_path, frame_range[0], frame_range[1])
+        
+        # Log input dimensions
+        height, width = images.shape[-2:]
+        logger.info(f"Input sequence dimensions: {width}x{height}")
+        
+        # Check and handle dimension mismatch if expected dimensions are provided
+        if dimensions is not None:
+            expected_width, expected_height = dimensions
+            logger.info(f"Expected dimensions: {expected_width}x{expected_height}")
+            if (width, height) != (expected_width, expected_height):
+                logger.warning(f"Dimension mismatch: Expected {expected_width}x{expected_height}, got {width}x{height}")
+                # Resize images to match expected dimensions
+                images = torch.nn.functional.interpolate(
+                    images,
+                    size=(expected_height, expected_width),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                logger.info(f"Resized images to {expected_width}x{expected_height}")
+        
+        # Track objects
+        with torch.inference_mode():
+            masks = self.model.track(state, images, bbox, points_positive, points_negative)
+            
+        # Convert masks to numpy and ensure they match expected dimensions
+        masks = masks.cpu().numpy()
+        if dimensions is not None:
+            expected_width, expected_height = dimensions
+            if masks.shape[-2:] != (expected_height, expected_width):
+                logger.warning(f"Resizing output masks to match expected dimensions {expected_width}x{expected_height}")
+                masks = np.stack([
+                    cv2.resize(mask, (expected_width, expected_height), interpolation=cv2.INTER_LINEAR)
+                    for mask in masks
+                ])
+        
+        return masks
 
     def reset_state(self):
         """Reset the model state and clear any cached data."""

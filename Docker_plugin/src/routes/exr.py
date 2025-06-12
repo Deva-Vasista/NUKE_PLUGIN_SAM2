@@ -20,6 +20,10 @@ import cv2
 import zipfile
 import io
 import json
+import gc
+from src.utils.gpu_manager import GPUManager
+from typing import List
+from tqdm import tqdm
 
 # Global monkey patching for PyTorch operations to prevent BFloat16 errors
 if hasattr(torch, "matmul"):
@@ -71,6 +75,7 @@ if hasattr(torch.nn.functional, "linear"):
 router = APIRouter()
 processor = SAMProcessor()
 progress_tracker = ProgressTracker()
+gpu_manager = GPUManager()
 
 def read_exr_to_numpy(file_path: str) -> np.ndarray:
     """Read EXR file and convert to numpy array."""
@@ -95,23 +100,24 @@ def read_exr_to_numpy(file_path: str) -> np.ndarray:
     return img
 
 def write_exr(mask: np.ndarray, output_path: str):
-    """Write numpy array to EXR file."""
-    height, width = mask.shape[-2:]
+    """Write numpy array to single-channel EXR file."""
+    height, width = mask.shape[:2]
     
+    # Create header with single channel
     header = OpenEXR.Header(width, height)
     header['channels'] = {
-        'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
-        'G': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
-        'B': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+        'A': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
     }
     
-    out = OpenEXR.OutputFile(output_path, header)
+    # Convert mask to float32
     mask_float = mask.astype(np.float32)
     
+    # Create output file
+    out = OpenEXR.OutputFile(output_path, header)
+    
+    # Write pixels with single channel
     out.writePixels({
-        'R': mask_float.tobytes(),
-        'G': mask_float.tobytes(),
-        'B': mask_float.tobytes()
+        'A': mask_float.tobytes()
     })
     out.close()
 
@@ -122,12 +128,10 @@ def write_exr_to_bytes(mask: np.ndarray) -> bytes:
     Future speedup: If OpenCV EXR writing is hardware-accelerated, could use cv2.imwrite to a buffer.
     For many masks, consider parallelizing this step.
     """
-    height, width = mask.shape[-2:]
+    height, width = mask.shape[:2]
     header = OpenEXR.Header(width, height)
     header['channels'] = {
-        'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
-        'G': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
-        'B': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+        'A': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
     }
     mask_float = mask.astype(np.float32)
     with tempfile.NamedTemporaryFile(delete=False, suffix='.exr') as tmp:
@@ -135,9 +139,7 @@ def write_exr_to_bytes(mask: np.ndarray) -> bytes:
     try:
         out = OpenEXR.OutputFile(tmp_path, header)
         out.writePixels({
-            'R': mask_float.tobytes(),
-            'G': mask_float.tobytes(),
-            'B': mask_float.tobytes()
+            'A': mask_float.tobytes()
         })
         out.close()
         with open(tmp_path, 'rb') as f:
@@ -158,6 +160,7 @@ async def process_exr(
         points_positive = request.get("points_positive", [])
         points_negative = request.get("points_negative", [])
         bits = request.get("bits", "32-bit float")
+        expected_dimensions = request.get("dimensions", None)
 
         # Convert Windows path to WSL path if needed
         if image_path.startswith("C:") or image_path.startswith("c:"):
@@ -186,21 +189,15 @@ async def process_exr(
         # Get image dimensions for coordinate normalization
         height, width = img.shape[:2]
         
-        # Normalize coordinates to [0,1] range
-        # Commented out since normalization is now handled in frontend
-        # if bbox is not None:
-        #     bbox = [
-        #         bbox[0] / width,  # x1
-        #         bbox[1] / height,  # y1
-        #         bbox[2] / width,  # x2
-        #         bbox[3] / height   # y2
-        #     ]
-            
-        # if points_positive:
-        #     points_positive = [[x / width, y / height] for x, y in points_positive]
-            
-        # if points_negative:
-        #     points_negative = [[x / width, y / height] for x, y in points_negative]
+        # Log dimensions for debugging
+        logger.info(f"Image dimensions: {width}x{height}")
+        if expected_dimensions:
+            logger.info(f"Expected dimensions: {expected_dimensions[0]}x{expected_dimensions[1]}")
+            if (width, height) != expected_dimensions:
+                logger.warning(f"Dimension mismatch: Expected {expected_dimensions[0]}x{expected_dimensions[1]}, got {width}x{height}")
+                # Resize image to match expected dimensions
+                img = cv2.resize(img, expected_dimensions, interpolation=cv2.INTER_LINEAR)
+                logger.info(f"Resized image to {expected_dimensions[0]}x{expected_dimensions[1]}")
             
         # Call model with normalized coordinates
         result = await processor.generate_mask_async(
@@ -234,8 +231,9 @@ async def process_sequence(
       - sequence_path: str
       - frame_range: [start, end]
       - bits: str (optional)
+      - dimensions: (width, height) (optional)
       - prompts: list of dicts, each with:
-          - frame_index: int
+          - frame_index: int (absolute frame number)
           - object_id: int
           - points_positive: list of [x, y]
           - points_negative: list of [x, y]
@@ -246,6 +244,7 @@ async def process_sequence(
     bits = request.get("bits", "32-bit float")
     prompts = request.get("prompts", [])
     reverse = request.get("reverse", False)
+    expected_dimensions = request.get("dimensions", None)
 
     # Create a task ID for progress tracking
     task_id = str(uuid.uuid4())
@@ -259,14 +258,14 @@ async def process_sequence(
         
         # Use patched init_state method that handles Windows paths and tensor types
         state, images, frame_start = processor.patched_init_state(
-        sequence_path,
-        offload_video_to_cpu=True,
-        frame_range_min=frame_range[0],
-        frame_range_max=frame_range[1],
-        original_fps=24,
-        target_fps=24,
-        bits=bits,
-    )
+            sequence_path,
+            offload_video_to_cpu=True,
+            frame_range_min=frame_range[0],
+            frame_range_max=frame_range[1],
+            original_fps=24,
+            target_fps=24,
+            bits=bits,
+        )
         
         await progress_tracker.update_progress(task_id, 10, "Sequence loaded successfully")
     except FileNotFoundError as e:
@@ -291,12 +290,18 @@ async def process_sequence(
             labels = [1] * len(points_positive) + [0] * len(points_negative)
             bbox = prompt.get("bbox")
 
+            # Convert absolute frame number to relative index
+            relative_frame_idx = frame_idx - frame_range[0]
+            if relative_frame_idx < 0 or relative_frame_idx >= len(images):
+                logger.warning(f"Frame index {frame_idx} is out of range. Skipping prompt.")
+                continue
+
             # Convert to tensors with right types
             points_tensor = torch.tensor(points, dtype=torch.float32) if points else None
             labels_tensor = torch.tensor(labels, dtype=torch.int32) if labels else None
             box_tensor = torch.tensor(bbox, dtype=torch.float32) if bbox is not None else None
 
-            logger.info(f"[API] Adding prompt for obj_id={obj_id} at frame_idx={frame_idx}: points+labels={list(zip(points, labels))} bbox={bbox}")
+            logger.info(f"[API] Adding prompt for obj_id={obj_id} at frame_idx={frame_idx} (relative_idx={relative_frame_idx}): points+labels={list(zip(points, labels))} bbox={bbox}")
 
             # Add prompt to model
             processor.model.add_new_points_or_box(
@@ -304,7 +309,7 @@ async def process_sequence(
                 box=box_tensor,
                 points=points_tensor,
                 labels=labels_tensor,
-                frame_idx=frame_idx,
+                frame_idx=relative_frame_idx,
                 obj_id=obj_id
             )
 
@@ -327,8 +332,8 @@ async def process_sequence(
     # Propagate
     await progress_tracker.update_progress(task_id, 30, "Starting mask propagation")
     start_frame_idx = 0
-    max_frame_num_to_track = frame_range[1] - 1
-    total_frames = frame_range[1] - frame_range[0] + 1
+    max_frame_num_to_track = len(images) - 1
+    total_frames = len(images)
     logger.info(f"[API] Propagating: start_frame_idx={start_frame_idx}, max_frame_num_to_track={max_frame_num_to_track}, reverse={reverse}")
     masks_by_frame = {}
     
@@ -445,13 +450,15 @@ async def process_sequence(
             # Save individual EXR files to output directory
             saved_files = []
             for frame_idx, masks in masks_by_frame.items():
+                # Convert relative frame index back to absolute frame number
+                absolute_frame_idx = frame_idx + frame_range[0]
                 # Combine all object masks into a single mask per frame
                 shape = next(iter(masks.values())).shape
                 combined_mask = np.zeros(shape, dtype=np.float32)
                 for obj_id, mask in masks.items():
                     combined_mask[mask > 0] = obj_id + 1  # unique label per object
-                # Save as EXR file
-                output_path = os.path.join(output_dir, f"mask_{frame_idx:04d}.exr")
+                # Save as EXR file with frame index starting from 1
+                output_path = os.path.join(output_dir, f"mask_{absolute_frame_idx:04d}.exr")
                 write_exr(combined_mask, output_path)
                 saved_files.append(output_path)
             # Also create a ZIP file for convenience
@@ -684,7 +691,11 @@ async def get_task_status(task_id: str):
 
 @router.post("/reset")
 async def reset_model_state():
-    """Reset the model state and clear any cached data."""
+    """Reset the model state and clear any cached data.
+    
+    This endpoint performs a basic cleanup while keeping the model loaded.
+    For complete cleanup including model unloading, use /api/v1/models/unload.
+    """
     try:
         # Reset the SAM processor
         success = processor.reset_state()
@@ -697,13 +708,31 @@ async def reset_model_state():
         except Exception as e:
             logger.warning(f"Non-critical error clearing progress tracker: {e}")
         
-        # Force GPU memory cleanup
+        # Perform basic GPU memory cleanup
         if torch.cuda.is_available():
+            # Clear PyTorch cache
             torch.cuda.empty_cache()
+            
+            # Clear any cached tensors
+            for obj in gc.get_objects():
+                try:
+                    if torch.is_tensor(obj):
+                        if obj.device.type == 'cuda':
+                            del obj
+                except:
+                    pass
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Log memory stats
+            stats = gpu_manager.get_memory_stats()
+            logger.info(f"Memory after reset: {stats}")
         
         return {
             "status": "success",
-            "message": "Model state reset successfully"
+            "message": "Model state reset successfully",
+            "memory_stats": gpu_manager.get_memory_stats() if torch.cuda.is_available() else None
         }
     except Exception as e:
         logger.error(f"Error resetting model state: {e}")
@@ -711,3 +740,40 @@ async def reset_model_state():
             status_code=500,
             detail=f"Failed to reset model state: {str(e)}"
         )
+
+def read_frames(frame_paths: List[str], progress_task=None) -> List[np.ndarray]:
+    """Read frames from a list of paths."""
+    frames = []
+    total_frames = len(frame_paths)
+    
+    # Create tqdm progress bar with a clean format
+    pbar = tqdm(
+        total=total_frames,
+        desc="Reading frames",
+        unit="frames",
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+    )
+    
+    for frame_path in frame_paths:
+        try:
+            # Read frame
+            frame = cv2.imread(frame_path, cv2.IMREAD_UNCHANGED)
+            if frame is None:
+                logger.error(f"Failed to read frame: {frame_path}")
+                continue
+                
+            # Convert to float32 if needed
+            if frame.dtype != np.float32:
+                frame = frame.astype(np.float32)
+                
+            frames.append(frame)
+            
+            # Update progress
+            pbar.update(1)
+                
+        except Exception as e:
+            logger.error(f"Error reading frame {frame_path}: {str(e)}")
+            continue
+            
+    pbar.close()
+    return frames
