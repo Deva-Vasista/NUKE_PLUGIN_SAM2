@@ -12,7 +12,7 @@ import tempfile
 import os
 from pathlib import Path
 from loguru import logger
-from src.utils.sequence_handler import EXRSequenceHandler
+from src.utils.sequence_handler import EXRSequenceHandler, detect_sequence_pattern
 from src.utils.progress_tracker import ProgressTracker
 import uuid
 import asyncio
@@ -251,6 +251,22 @@ async def process_sequence(
     await progress_tracker.create_task(task_id)
     await progress_tracker.update_progress(task_id, 0, "Initializing model and loading sequence")
 
+    # Initialize sequence handler
+    try:
+        sequence_handler = EXRSequenceHandler(
+            sequence_path=sequence_path,
+            frame_range=frame_range,
+            original_fps=24,
+            target_fps=24,
+            bits=bits,
+            image_size=1024
+        )
+        await progress_tracker.update_progress(task_id, 10, "Sequence handler initialized")
+    except Exception as e:
+        logger.error(f"Error initializing sequence handler: {str(e)}")
+        await progress_tracker.complete_task(task_id, False, f"Error initializing sequence handler: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error initializing sequence handler: {str(e)}")
+
     # Load model/state
     try:
         # Enforce float32 precision throughout the model
@@ -267,7 +283,7 @@ async def process_sequence(
             bits=bits,
         )
         
-        await progress_tracker.update_progress(task_id, 10, "Sequence loaded successfully")
+        await progress_tracker.update_progress(task_id, 20, "Sequence loaded successfully")
     except FileNotFoundError as e:
         error_msg = str(e)
         logger.error(f"File not found error: {error_msg}")
@@ -447,6 +463,7 @@ async def process_sequence(
             # Save to output directory instead of streaming
             output_dir = os.path.join("Output", task_id)
             os.makedirs(output_dir, exist_ok=True)
+            
             # Save individual EXR files to output directory
             saved_files = []
             for frame_idx, masks in masks_by_frame.items():
@@ -457,10 +474,15 @@ async def process_sequence(
                 combined_mask = np.zeros(shape, dtype=np.float32)
                 for obj_id, mask in masks.items():
                     combined_mask[mask > 0] = obj_id + 1  # unique label per object
-                # Save as EXR file with frame index starting from 1
-                output_path = os.path.join(output_dir, f"mask_{absolute_frame_idx:04d}.exr")
+                
+                # Generate output path using sequence handler
+                output_path = sequence_handler.get_output_path(absolute_frame_idx)
+                output_path = os.path.join(output_dir, os.path.basename(output_path))
+                
+                # Save the mask
                 write_exr(combined_mask, output_path)
                 saved_files.append(output_path)
+            
             # Also create a ZIP file for convenience
             zip_path = os.path.join(output_dir, f"masks_{task_id}.zip")
             with zipfile.ZipFile(zip_path, "w") as zipf:

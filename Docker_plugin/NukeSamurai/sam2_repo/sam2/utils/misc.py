@@ -223,33 +223,74 @@ class AsyncVideoFrameLoader:
 #     #     )
 
 
+def detect_sequence_pattern(path):
+    """
+    Detect sequence pattern in path and extract naming components.
+    Returns:
+    - pattern: The sequence pattern (e.g., %05d)
+    - padding: Number of digits
+    - base_name: The part before the frame number
+    - extension: The file extension
+    """
+    # First try to find standard sequence patterns (%03d to %10d)
+    for i in range(3, 11):
+        pattern = f"%0{i}d"
+        if pattern in path:
+            # Split the path into components
+            parts = path.split(pattern)
+            if len(parts) == 2:  # We have a base name and extension
+                base_name = parts[0]
+                extension = os.path.splitext(parts[1])[1]
+                return pattern, i, base_name, extension
+    
+    # If no standard pattern found, try to detect custom patterns
+    # Look for a sequence of digits that could be a frame number
+    match = re.search(r'(\D+)(\d+)(\.[^.]+)$', path)
+    if match:
+        base_name = match.group(1)
+        frame_num = match.group(2)
+        extension = match.group(3)
+        padding = len(frame_num)
+        pattern = f"%0{padding}d"
+        return pattern, padding, base_name, extension
+    
+    return None, None, None, None
+
+
 def create_reads(
     save_path,
     output_video_path_folder,
     output_file_name,
     save_to_file
 ):
-
-    if save_to_file == "exr" :
+    if save_to_file == "exr":
         nuke.createNode('Read')
-        if "%04d" in save_path :
-            nuke.selectedNode().knob('file').setValue(r"%s" % str(os.path.dirname(save_path)) +"/"+
-                                                                    str(os.path.splitext(os.path.basename(save_path.replace('%04d', '####')))[0]) +".exr")
-        elif "%03d" in save_path :
-            nuke.selectedNode().knob('file').setValue(r"%s" % str(os.path.dirname(save_path))+"/"+
-                                                                    str(os.path.splitext(os.path.basename(save_path.replace('%03d', '###')))[0]) +".exr")
-        nuke.selectedNode().knob('first').setValue(1)
-        nuke.selectedNode().knob('last').setValue(int(nuke.root().knob('last_frame').getValue())) 
-        nuke.tprint("Generating mask done")
-        nuke.message("Generating mask done") 
+        pattern, digits, base_name, extension = detect_sequence_pattern(save_path)
+        if pattern:
+            # Convert %04d to #### format for Nuke
+            nuke_pattern = '#' * digits
+            if base_name and extension:
+                # For custom patterns, construct the path manually
+                nuke_path = f"{base_name}mask_{nuke_pattern}{extension}"
+            else:
+                # For standard patterns, replace the pattern in the full path
+                nuke_path = save_path.replace(pattern, nuke_pattern)
+            
+            nuke.selectedNode().knob('file').setValue(
+                r"%s" % str(os.path.dirname(save_path)) + "/" + nuke_path
+            )
+            nuke.selectedNode().knob('first').setValue(1)
+            nuke.selectedNode().knob('last').setValue(int(nuke.root().knob('last_frame').getValue())) 
+            nuke.tprint("Generating mask done")
+            nuke.message("Generating mask done")
+        else:
+            raise TypeError("Invalid sequence pattern. Expected frame pattern or custom naming pattern")
 
-    if save_to_file == "mp4" :
+    if save_to_file == "mp4":
         nuke.createNode('Read')  
         nuke.selectedNode().knob('file').setValue(r"%s" % (os.path.join(output_video_path_folder,output_file_name + ".mp4")))
         nuke.selectedNode().knob('first').setValue(1)
-        nuke.selectedNode().knob('last').setValue(int(nuke.root().knob('last_frame').getValue())) 
-        nuke.tprint("Generating mask done")
-        nuke.message("Generating mask done") 
+        nuke.selectedNode().knob('last').setValue(int(nuke.root().knob('last_frame').getValue()))
     
 
 
@@ -268,21 +309,28 @@ class ImgSequences :
         self.input_file_name = str(os.path.splitext(os.path.basename(path))[0])
         self.file_extension = str(os.path.splitext(os.path.basename(path))[1])
         
-        
-        if "%04d" in self.input_file_name :
-            self.input_file_name_split = re.split("%04d", self.input_file_name)[0]
-        elif "%03d" in self.input_file_name :
-            self.input_file_name_split = re.split("%03d", self.input_file_name)[0]  
-        else :
-            raise TypeError("Input is not a sequence")
-        
+        # Detect sequence pattern and components
+        pattern, digits, base_name, extension = detect_sequence_pattern(self.input_file_name)
+        if pattern:
+            self.frame_pattern = pattern
+            self.padding = digits
+            self.base_name = base_name
+            self.extension = extension
+            # Create output base name by adding "_mask_" before the frame number
+            self.output_base_name = f"{base_name}mask_"
+        else:
+            raise TypeError("Input is not a sequence. Expected frame pattern or custom naming pattern")
 
-        cut_fn = re.split(r"[{}]".format(self.input_file_name_split[-1]), self.input_file_name)
-        try : 
-            self.index = cut_fn.index("%04d")
-        except : 
-             self.index = cut_fn.index("%03d")
-       
+        # Get the index for frame number extraction
+        if self.frame_pattern:
+            cut_fn = re.split(r"[{}]".format(self.base_name[-1] if self.base_name else ""), self.input_file_name)
+            try:
+                self.index = cut_fn.index(self.frame_pattern)
+            except ValueError:
+                raise TypeError(f"Invalid sequence pattern in {self.input_file_name}")
+        else:
+            # For custom patterns, we don't need an index
+            self.index = None
         
     def ReadSequence(self):  
         original_fps = self.original_fps
@@ -294,22 +342,24 @@ class ImgSequences :
         # CPU Offload option is coming soon
         compute_device=torch.device("cuda")
 
-        nuke.tprint('Reading image sequence : ' +str(self.path) )
+        nuke.tprint('Reading image sequence : ' +str(self.path))
         
         if self.target_fps < 0:
             self.target_fps = 24
         
         target_fps = self.target_fps
         stride = max(round(original_fps / target_fps), 1)
+        
         # Get all frames in folder
         frame_paths = []  
         for filename in os.listdir(self.input_path_folder):
-            
             if self.file_extension in os.path.basename(filename):
-                
-                if self.input_file_name_split in filename:
-                    seq = os.path.join(self.input_path_folder, filename)
-                    frame_paths.append(seq)   
+                if self.base_name in filename:
+                    # Extract frame number using the correct padding
+                    frame_num = re.search(r'\d{' + str(self.padding) + '}', filename)
+                    if frame_num:
+                        seq = os.path.join(self.input_path_folder, filename)
+                        frame_paths.append(seq)   
         frame_paths = sorted(frame_paths)
             
         nuke.tprint(str(len(frame_paths)) + ' frames from sequence detected')    
@@ -317,66 +367,54 @@ class ImgSequences :
         # Get all index
         convert_num = []
         for num in frame_paths:
-            
             num = os.path.splitext(os.path.basename(num))[0]
-            num = re.split(r"[{}]".format(self.input_file_name_split[-1]), num)
+            num = re.split(r"[{}]".format(self.base_name[-1] if self.base_name else ""), num)
             num = num[self.index]
-            
             convert_num.append(int(num))
         convert_num = np.array(convert_num)
-
 
         process_len = self.frame_range_max - self.frame_range_min
         frame_start = self.frame_range_min - np.min(convert_num)
 
-        nuke.tprint('Process length : ' +str(process_len) )   
-        nuke.tprint('Frame range : ' + str(self.frame_range_min) + " - " + str( self.frame_range_max-1)) 
+        nuke.tprint('Process length : ' +str(process_len))   
+        nuke.tprint('Frame range : ' + str(self.frame_range_min) + " - " + str(self.frame_range_max-1)) 
         
         images = torch.zeros(process_len, 3, self.image_size, self.image_size, dtype=torch.float32)
         
         # Reading only necessary frames
         frame_count = 0   
         renderProgress = nuke.ProgressTask('Reading frames..')
-        for fpath in tqdm(range(0,process_len), desc="Reading frames") :
-            
-            
+        for fpath in tqdm(range(0,process_len), desc="Reading frames"):
             Step = 100 / process_len    
             renderProgress.setProgress(int(frame_count * Step))
             renderProgress.setMessage("Reading frames: (" + str(frame_count+1) + " of " + str(process_len) +")")
             if renderProgress.isCancelled():
-                
                 gc.collect()
                 torch.cuda.empty_cache()
                 del renderProgress
                 raise Exception("Generation aborted")  
             
             if frame_count % stride == 0:
-                
                 fpath = frame_paths[frame_start]
-                frame = cv2.imread(fpath, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH ) 
+                frame = cv2.imread(fpath, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH) 
                 original_height,original_width = frame.shape[:2]
                 frame = cv2.resize(frame, (self.image_size, self.image_size))
                 frame = np.array(frame)
                 frame = torch.from_numpy(frame).permute(2,0,1)
 
-                if "float" not in self.bits :
-                    
+                if "float" not in self.bits:
                     if "8" in self.bits:
                         #Normalizing 8 bit values to fit in a 0-1 range
                         frame = frame/255
-                        
                     if "10" in self.bits:
                         #Normalizing 10 bit values to fit in a 0-1 range
                         frame = frame/1023
-                        
                     if "12" in self.bits:
                         #Normalizing 12 bit values to fit in a 0-1 range
                         frame = frame/4095
-
                     if "14" in self.bits:
-                        #Normalizing 12 bit values to fit in a 0-1 range
+                        #Normalizing 14 bit values to fit in a 0-1 range
                         frame = frame/16383
-
                     if "16" in self.bits:
                         # Normalizing 16 bit values to fit in a 0-1 range
                         frame = frame/65535
@@ -385,7 +423,6 @@ class ImgSequences :
             frame_count += 1  
             frame_start += 1
 
-       
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
         img_std = img_std.to(compute_device)
@@ -393,7 +430,6 @@ class ImgSequences :
         # Normalizing by mean & std
         images -= img_mean
         images /= img_std
-       
         
         frame_start = self.frame_range_min - np.min(convert_num)
         del renderProgress
