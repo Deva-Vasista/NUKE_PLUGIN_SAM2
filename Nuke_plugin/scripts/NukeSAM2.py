@@ -9,13 +9,480 @@ import cv2
 from urllib.parse import urljoin
 import zipfile
 import time
+import re
+import tempfile
+import numpy as np
 
 # API Configuration
-API_BASE_URL = "http://192.168.12.166:8000"
+API_BASE_URL = "http://localhost:8000"  # Default URL
 API_VERSION = "v1"
+_current_api_url = API_BASE_URL  # Class variable to store current API URL
+
+def set_api_base_url():
+    """Set the API base URL from the node's configuration"""
+    global _current_api_url
+    try:
+        node = nuke.thisNode()
+        if node and node.knob('APIBaseURL'):
+            url = node.knob('APIBaseURL').value()
+            if url and url.strip():
+                # Validate URL format
+                if not url.startswith(('http://', 'https://')):
+                    url = 'http://' + url
+                _current_api_url = url.strip()
+                nuke.tprint(f"API Base URL set to: {_current_api_url}")
+                return
+    except:
+        pass
+    # Reset to default if empty or invalid
+    _current_api_url = API_BASE_URL
+    nuke.tprint(f"API Base URL reset to default: {_current_api_url}")
+
+def get_api_base_url():
+    """Get the current API base URL"""
+    global _current_api_url
+    try:
+        node = nuke.thisNode()
+        if node and node.knob('APIBaseURL'):
+            url = node.knob('APIBaseURL').value()
+            if url and url.strip():
+                # Validate URL format
+                if not url.startswith(('http://', 'https://')):
+                    url = 'http://' + url
+                _current_api_url = url.strip()
+                return _current_api_url
+    except:
+        pass
+    return _current_api_url
+
+def start_docker_server():
+    """Start the Docker container using docker compose"""
+    try:
+        # Get the directory containing the Nuke plugin script
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        docker_compose_path = os.path.join(plugin_dir, 'docker-compose.yml')
+        
+        if not os.path.exists(docker_compose_path):
+            nuke.message("Error: docker-compose.yml not found in plugin directory.\nPlease ensure docker-compose.yml is in the same directory as NukeSAM2.py")
+            return False
+            
+        # Check if Docker is running
+        try:
+            import subprocess
+            process = subprocess.run(['docker', 'info'], capture_output=True, text=True)
+            if process.returncode != 0:
+                nuke.message("Error: Docker is not running. Please start Docker Desktop first.")
+                return False
+        except Exception as e:
+            nuke.message("Error: Docker is not installed or not accessible. Please ensure Docker is installed and running.")
+            return False
+            
+        # Start the container in a background thread
+        def run_docker_compose():
+            try:
+                import subprocess
+                # First check if the container is already running
+                process = subprocess.run(
+                    ['docker', 'compose', 'ps', '--format', 'json'],
+                    cwd=plugin_dir,
+                    capture_output=True,
+                    text=True
+                )
+                
+                if process.returncode == 0 and process.stdout.strip():
+                    nuke.executeInMainThread(lambda: nuke.message("Docker server is already running!"))
+                    nuke.executeInMainThread(lambda: update_status_safely("Server: Running"))
+                    return
+                
+                # Start the container
+                process = subprocess.Popen(
+                    ['docker', 'compose', 'up', '-d'],
+                    cwd=plugin_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout, stderr = process.communicate()
+                
+                if process.returncode == 0:
+                    nuke.executeInMainThread(lambda: nuke.message("Docker server started successfully!"))
+                    nuke.executeInMainThread(lambda: update_status_safely("Server: Running"))
+                else:
+                    error_msg = f"Failed to start Docker server: {stderr}"
+                    nuke.executeInMainThread(lambda: nuke.message(error_msg))
+                    nuke.executeInMainThread(lambda: update_status_safely("Server: Failed to start"))
+            except Exception as e:
+                error_msg = f"Error starting Docker server: {str(e)}"
+                nuke.executeInMainThread(lambda: nuke.message(error_msg))
+                nuke.executeInMainThread(lambda: update_status_safely("Server: Error"))
+        
+        # Start the thread
+        thread = threading.Thread(target=run_docker_compose)
+        thread.daemon = True
+        thread.start()
+        
+        return True
+    except Exception as e:
+        nuke.message(f"Error starting Docker server: {str(e)}")
+        return False
+
+def stop_docker_server():
+    """Stop the Docker container using docker compose"""
+    try:
+        # Get the directory containing the Nuke plugin script
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        docker_compose_path = os.path.join(plugin_dir, 'docker-compose.yml')
+        
+        if not os.path.exists(docker_compose_path):
+            nuke.message("Error: docker-compose.yml not found in plugin directory.\nPlease ensure docker-compose.yml is in the same directory as NukeSAM2.py")
+            return False
+            
+        # Stop the container in a background thread
+        def run_docker_compose_down():
+            try:
+                import subprocess
+                # First check if the container is running
+                process = subprocess.run(
+                    ['docker', 'compose', 'ps', '--format', 'json'],
+                    cwd=plugin_dir,
+                    capture_output=True,
+                    text=True
+                )
+                
+                if process.returncode != 0 or not process.stdout.strip():
+                    nuke.executeInMainThread(lambda: nuke.message("Docker server is not running!"))
+                    nuke.executeInMainThread(lambda: update_status_safely("Server: Stopped"))
+                    return
+                
+                # Stop the container
+                process = subprocess.Popen(
+                    ['docker', 'compose', 'down'],
+                    cwd=plugin_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout, stderr = process.communicate()
+                
+                if process.returncode == 0:
+                    nuke.executeInMainThread(lambda: nuke.message("Docker server stopped successfully!"))
+                    nuke.executeInMainThread(lambda: update_status_safely("Server: Stopped"))
+                else:
+                    error_msg = f"Failed to stop Docker server: {stderr}"
+                    nuke.executeInMainThread(lambda: nuke.message(error_msg))
+                    nuke.executeInMainThread(lambda: update_status_safely("Server: Failed to stop"))
+            except Exception as e:
+                error_msg = f"Error stopping Docker server: {str(e)}"
+                nuke.executeInMainThread(lambda: nuke.message(error_msg))
+                nuke.executeInMainThread(lambda: update_status_safely("Server: Error"))
+        
+        # Start the thread
+        thread = threading.Thread(target=run_docker_compose_down)
+        thread.daemon = True
+        thread.start()
+        
+        return True
+    except Exception as e:
+        nuke.message(f"Error stopping Docker server: {str(e)}")
+        return False
+
+def check_server_status():
+    """Check if the Docker container is running"""
+    try:
+        import subprocess
+        # Get the directory containing the Nuke plugin script
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        process = subprocess.run(
+            ['docker', 'compose', 'ps', '--format', 'json'],
+            cwd=plugin_dir,
+            capture_output=True,
+            text=True
+        )
+        
+        if process.returncode == 0 and process.stdout.strip():
+            return True
+        return False
+    except:
+        return False
+
+class PollingMonitor:
+    def __init__(self, task_id, on_progress=None, on_error=None, on_complete=None):
+        self.task_id = task_id
+        self.on_progress = on_progress or (lambda p, m: None)
+        self.on_error = on_error or (lambda e: None)
+        self.on_complete = on_complete or (lambda: None)
+        self.running = False
+        self.last_progress = 0
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 5
+        self.base_polling_interval = 1.0  # Base interval in seconds
+        self.min_polling_interval = 0.5   # Minimum interval
+        self.max_polling_interval = 5.0   # Maximum interval
+        self.progress_threshold = 0.1     # Progress threshold for interval adjustment
+        self.last_poll_time = time.time()
+        self.start_time = time.time()
+        self.max_polling_duration = 3600  # Maximum polling duration (1 hour)
+        self.status_check_count = 0
+        self.max_status_checks = 60  # Maximum number of status checks after completion
+        self.files_ready = False
+
+    def calculate_polling_interval(self, current_progress):
+        """Calculate adaptive polling interval based on progress"""
+        if current_progress == self.last_progress:
+            # If no progress, gradually increase interval up to max
+            return min(self.base_polling_interval * (1.1 ** self.consecutive_errors), 
+                      self.max_polling_interval)
+        else:
+            # If progress made, decrease interval down to min
+            progress_delta = current_progress - self.last_progress
+            if progress_delta > self.progress_threshold:
+                return max(self.base_polling_interval * 0.8, self.min_polling_interval)
+            return self.base_polling_interval
+
+    def poll_status(self):
+        """Poll the task status with adaptive intervals"""
+        self.running = True
+        self.start_time = time.time()
+
+        while self.running:
+            try:
+                # Check if we've exceeded maximum polling duration
+                if time.time() - self.start_time > self.max_polling_duration:
+                    self.on_error("Polling timeout exceeded maximum duration")
+                    break
+
+                # Calculate time since last poll
+                time_since_last_poll = time.time() - self.last_poll_time
+                current_interval = self.calculate_polling_interval(self.last_progress)
+
+                # Only poll if enough time has passed
+                if time_since_last_poll >= current_interval:
+                    response = requests.get(
+                        f"{API_BASE_URL}/api/{API_VERSION}/status/{self.task_id}",
+                        timeout=5
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        current_progress = int(data.get('progress', 0))
+                        message = data.get('message', '')
+                        status = data.get('status', 'running')
+
+                        # Update progress
+                        self.on_progress(current_progress, message)
+                        self.last_progress = current_progress
+                        self.consecutive_errors = 0
+
+                        # Check for completion
+                        if status in ['completed', 'failed']:
+                            if status == 'completed':
+                                # Check if files are ready
+                                try:
+                                    output_response = requests.get(f"{API_BASE_URL}/api/{API_VERSION}/output/{self.task_id}")
+                                    if output_response.status_code == 200:
+                                        self.files_ready = True
+                                        self.on_complete()
+                                        break
+                                    else:
+                                        # Increment status check counter
+                                        self.status_check_count += 1
+                                        if self.status_check_count >= self.max_status_checks:
+                                            self.on_error("Maximum status checks exceeded after completion")
+                                            break
+                                except Exception as e:
+                                    self.on_error(f"Error checking file status: {str(e)}")
+                                    break
+                            else:
+                                error = data.get('error', 'Unknown error')
+                                self.on_error(f"Task failed: {error}")
+                                break
+
+                    else:
+                        self.consecutive_errors += 1
+                        if self.consecutive_errors >= self.max_consecutive_errors:
+                            self.on_error(f"Too many consecutive errors ({self.consecutive_errors})")
+                            break
+                        self.on_progress(self.last_progress, f"Error: HTTP {response.status_code}")
+
+                # Sleep for a short time to prevent CPU overuse
+                time.sleep(0.1)
+
+            except requests.exceptions.RequestException as e:
+                self.consecutive_errors += 1
+                if self.consecutive_errors >= self.max_consecutive_errors:
+                    self.on_error(f"Connection error: {str(e)}")
+                    break
+                self.on_progress(self.last_progress, f"Connection error: {str(e)}")
+                time.sleep(current_interval)
+
+            except Exception as e:
+                self.on_error(f"Unexpected error: {str(e)}")
+                break
+
+        self.running = False
+
+    def stop(self):
+        """Stop the polling monitor"""
+        self.running = False
+
+def start_polling_monitor(task_id, on_progress=None, on_error=None, on_complete=None):
+    """Start a new polling monitor in a background thread"""
+    monitor = PollingMonitor(task_id, on_progress, on_error, on_complete)
+    thread = threading.Thread(target=monitor.poll_status)
+    thread.daemon = True
+    thread.start()
+    return monitor
+
+class WebSocketMonitor:
+    def __init__(self, task_id, on_progress=None, on_error=None, on_complete=None):
+        self.task_id = task_id
+        self.on_progress = on_progress or (lambda p, m: None)
+        self.on_error = on_error or (lambda e: None)
+        self.on_complete = on_complete or (lambda: None)
+        self.connection_lost = False
+        self.last_progress = 0
+        self.last_message = ""
+        self.websocket = None
+        self.polling_monitor = None
+        self.running = True
+        self.completed = False
+        self.files_ready = False
+        self.retry_count = 0
+        self.max_retries = 3
+        self.status_check_count = 0
+        self.max_status_checks = 60  # Maximum number of status checks after completion
+        self.download_attempts = 0
+        self.max_download_attempts = 3
+
+    async def start(self):
+        """Start monitoring with WebSocket, falling back to HTTP polling if needed"""
+        try:
+            ws_url = f"ws://{API_BASE_URL.replace('http://', '')}/api/{API_VERSION}/ws/{self.task_id}"
+            nuke.executeInMainThread(lambda: nuke.tprint(f"Attempting WebSocket connection to {ws_url}"))
+            self.websocket = await connect_with_retry(ws_url)
+            if not self.websocket:
+                nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection failed, starting HTTP polling"))
+                self.start_polling()
+                return
+
+            nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection established, monitoring progress..."))
+            
+            while self.running and not self.connection_lost:
+                try:
+                    data = await asyncio.wait_for(self.websocket.recv(), timeout=30)
+                    await self.handle_message(data)
+                    # If files are ready, exit the monitoring loop
+                    if self.files_ready:
+                        break
+                except asyncio.TimeoutError:
+                    if not await self.check_connection():
+                        nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection lost, falling back to HTTP polling"))
+                        self.connection_lost = True
+                        self.start_polling()
+                        break
+                except websockets.exceptions.ConnectionClosed as e:
+                    nuke.executeInMainThread(lambda e=e: nuke.tprint(f"WebSocket connection closed: {e}"))
+                    if not self.files_ready:
+                        if self.retry_count < self.max_retries:
+                            self.retry_count += 1
+                            nuke.executeInMainThread(lambda: nuke.tprint(f"Attempting to reconnect (attempt {self.retry_count}/{self.max_retries})..."))
+                            await asyncio.sleep(2 ** self.retry_count)  # Exponential backoff
+                            self.websocket = await connect_with_retry(ws_url)
+                            if self.websocket:
+                                self.connection_lost = False
+                                continue
+                        self.connection_lost = True
+                        self.start_polling()
+                    break
+                except Exception as e:
+                    nuke.executeInMainThread(lambda e=e: nuke.tprint(f"WebSocket error: {e}"))
+                    if not self.files_ready:
+                        self.connection_lost = True
+                        self.start_polling()
+                    break
+
+        except Exception as e:
+            nuke.executeInMainThread(lambda e=e: nuke.tprint(f"WebSocket connection error: {e}"))
+            if not self.files_ready:
+                self.connection_lost = True
+                self.start_polling()
+
+    async def handle_message(self, data):
+        """Handle incoming WebSocket message"""
+        try:
+            progress_data = json.loads(data)
+            self.last_progress = int(progress_data.get('progress', 0))
+            self.last_message = progress_data.get('message', '')
+            status = progress_data.get('status', 'running')
+            
+            # Update progress
+            self.on_progress(self.last_progress, self.last_message)
+            
+            # Handle completion states
+            if status == "completed":
+                self.completed = True
+                # Check if files are ready
+                try:
+                    response = requests.get(f"{API_BASE_URL}/api/{API_VERSION}/output/{self.task_id}")
+                    if response.status_code == 200:
+                        self.files_ready = True
+                        nuke.executeInMainThread(lambda: nuke.tprint("Files are ready for download"))
+                        # Don't call on_complete here, let the download process handle it
+                        await self.stop()
+                        return  # Exit the monitoring loop
+                    else:
+                        nuke.executeInMainThread(lambda: nuke.tprint(f"Waiting for files to be ready... (status: {response.status_code})"))
+                except requests.exceptions.RequestException as e:
+                    nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error checking file status: {e}"))
+                    self.on_error(f"Error checking file status: {str(e)}")
+                except Exception as e:
+                    nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Unexpected error checking file status: {e}"))
+                    self.on_error(f"Unexpected error: {str(e)}")
+            elif status == "failed":
+                error = progress_data.get('error', 'Unknown error')
+                self.on_error(f"Task failed: {error}")
+                self.running = False
+                await self.stop()
+        except json.JSONDecodeError as e:
+            nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error parsing WebSocket message: {e}"))
+            self.on_error(f"Error parsing message: {str(e)}")
+        except Exception as e:
+            nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error handling WebSocket message: {e}"))
+            self.on_error(f"Error handling message: {str(e)}")
+
+    def start_polling(self):
+        """Start HTTP polling monitor if not already running"""
+        if not self.polling_monitor and not self.files_ready:
+            nuke.executeInMainThread(lambda: nuke.tprint("Starting HTTP polling monitor..."))
+            self.polling_monitor = start_polling_monitor(
+                self.task_id,
+                on_progress=self.on_progress,
+                on_error=self.on_error,
+                on_complete=self.on_complete
+            )
+
+    async def stop(self):
+        """Stop the WebSocket connection and polling monitor"""
+        self.running = False
+        if self.websocket:
+            try:
+                nuke.executeInMainThread(lambda: nuke.tprint("Closing WebSocket connection..."))
+                await self.websocket.close()
+                nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection closed successfully"))
+            except Exception as e:
+                nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error closing WebSocket: {e}"))
+            finally:
+                self.websocket = None
+        
+        # Stop polling monitor if it exists
+        if self.polling_monitor:
+            nuke.executeInMainThread(lambda: nuke.tprint("Stopping HTTP polling monitor..."))
+            self.polling_monitor.stop()
+            self.polling_monitor = None
+            nuke.executeInMainThread(lambda: nuke.tprint("HTTP polling monitor stopped"))
 
 class ThreadedTask:
-    """Helper class to run API requests in background threads"""
     def __init__(self, on_complete=None, on_progress=None, on_error=None):
         self.on_complete = on_complete or (lambda result: None)
         self.on_progress = on_progress or (lambda progress, message: None)
@@ -24,7 +491,7 @@ class ThreadedTask:
         self.running = False
         self.task_id = None
         self._error_reported = False
-        
+
     def run_in_background(self, func, *args, **kwargs):
         """Run the provided function in a background thread"""
         self.thread = threading.Thread(target=self._run_task, args=(func, args, kwargs))
@@ -33,7 +500,7 @@ class ThreadedTask:
         self._error_reported = False
         self.thread.start()
         return self
-        
+
     def _run_task(self, func, args, kwargs):
         """Internal method to execute the task and handle callbacks"""
         try:
@@ -52,26 +519,6 @@ class ThreadedTask:
                     pass
         finally:
             self.running = False
-            
-    def cancel(self):
-        """Cancel the running task"""
-        self.running = False
-        if self.task_id:
-            # Try to cancel the task on the server too
-            try:
-                requests.post(f"{API_BASE_URL}/api/{API_VERSION}/cancel/{self.task_id}")
-            except:
-                pass  # Ignore errors when cancelling
-    
-    def report_error(self, error_msg):
-        """Report an error and set the error flag"""
-        self._error_reported = True
-        nuke.executeInMainThread(lambda err=error_msg: self.on_error(err))
-        # Also update status to show the error
-        try:
-            nuke.executeInMainThread(lambda msg=error_msg: update_status_safely(f"Error: {msg}"))
-        except:
-            pass
 
     def start_progress_monitor(self, task_id):
         """Start monitoring progress for a task"""
@@ -79,7 +526,7 @@ class ThreadedTask:
         monitor_thread = threading.Thread(target=self._monitor_progress_thread, args=(task_id,))
         monitor_thread.daemon = True
         monitor_thread.start()
-        
+
     def _monitor_progress_thread(self, task_id):
         """Background thread to monitor progress via HTTP polling"""
         loop = asyncio.new_event_loop()
@@ -88,20 +535,20 @@ class ThreadedTask:
             loop.run_until_complete(self._monitor_progress_async(task_id))
         finally:
             loop.close()
-        
+
     async def _monitor_progress_async(self, task_id):
         """Async method to monitor progress via WebSocket"""
-        uri = f"ws://localhost:8000/api/{API_VERSION}/ws/{task_id}"
+        uri = f"ws://{API_BASE_URL.replace('http://', '')}/api/{API_VERSION}/ws/{task_id}"
         completed = False
         connection_attempts = 0
         max_connection_attempts = 3
-        
+
         while connection_attempts < max_connection_attempts and self.running:
             try:
                 async with websockets.connect(uri, ping_timeout=20, close_timeout=10) as websocket:
                     connection_attempts = 0  # Reset counter on successful connection
                     nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection established, monitoring progress..."))
-                    
+
                     while self.running:
                         try:
                             data = await asyncio.wait_for(websocket.recv(), timeout=30)
@@ -114,6 +561,7 @@ class ThreadedTask:
                                 if status == 'completed':
                                     completed = True
                                     nuke.executeInMainThread(lambda: self.on_progress(100, "Processing completed successfully"))
+                                    nuke.executeInMainThread(lambda: self.on_complete(None))
                                 if status == 'failed':
                                     error = progress_data.get('error', 'Unknown error')
                                     nuke.executeInMainThread(lambda e=error: self.on_error(f"Task failed: {e}"))
@@ -144,6 +592,7 @@ class ThreadedTask:
                 else:
                     nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection failed, falling back to HTTP polling"))
                     break
+
         # HTTP polling fallback
         try:
             status_url = f"{API_BASE_URL}/api/{API_VERSION}/status/{task_id}"
@@ -161,6 +610,7 @@ class ThreadedTask:
                         if status in ['completed', 'failed']:
                             if status == 'completed':
                                 nuke.executeInMainThread(lambda: self.on_progress(100, "Processing completed successfully"))
+                                nuke.executeInMainThread(lambda: self.on_complete(None))
                             if status == 'failed':
                                 error = progress_data.get('error', 'Unknown error')
                                 nuke.executeInMainThread(lambda e=error: self.on_error(f"Task failed: {e}"))
@@ -171,6 +621,26 @@ class ThreadedTask:
                     time.sleep(3)
         except Exception as e:
             nuke.executeInMainThread(lambda e=e: nuke.tprint(f"Error checking task output: {e}"))
+
+    def cancel(self):
+        """Cancel the running task"""
+        self.running = False
+        if self.task_id:
+            # Try to cancel the task on the server too
+            try:
+                requests.post(f"{API_BASE_URL}/api/{API_VERSION}/cancel/{self.task_id}")
+            except:
+                pass  # Ignore errors when cancelling
+
+    def report_error(self, error_msg):
+        """Report an error and set the error flag"""
+        self._error_reported = True
+        nuke.executeInMainThread(lambda err=error_msg: self.on_error(err))
+        # Also update status to show the error
+        try:
+            nuke.executeInMainThread(lambda msg=error_msg: update_status_safely(f"Error: {msg}"))
+        except:
+            pass
 
 class Prompt:
     def __init__(self):
@@ -220,6 +690,121 @@ class BoundingBox:
     min_frame = None
     max_frame = None
     current_object_id = 0  # Track current object ID
+    _image_cache = {}  # Cache for loaded images
+    _cache_size = 5  # Number of frames to keep in cache
+    _last_loaded_frame = None
+    _last_loaded_image = None
+    _image_dimensions = None  # Store image dimensions
+    _zoom_scale = 1.0  # Current zoom scale
+    _zoom_center = None  # Center point for zooming
+    _offset = np.array([0, 0], dtype=np.float32)  # Pan offset
+
+
+    @classmethod
+    def get_image_dimensions(cls, frame_path):
+        """Get image dimensions and log them"""
+        img = cv2.imread(frame_path)
+        if img is not None:
+            height, width = img.shape[:2]
+            nuke.tprint(f"Image dimensions for {frame_path}: {width}x{height}")
+            return height, width
+        nuke.tprint(f"Failed to get dimensions for {frame_path}")
+        return None
+
+    @classmethod
+    def _load_image(cls, frame_path):
+        """Load image with caching and dimension tracking"""
+        # If this frame is already in cache, return it
+        if frame_path in cls._image_cache:
+            return cls._image_cache[frame_path]
+
+        # Load the image
+        img = cv2.imread(frame_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+        if img is None:
+            nuke.tprint(f"Failed to load image: {frame_path}")
+            return None
+
+        # Store dimensions if not already set
+        if cls._image_dimensions is None:
+            cls._image_dimensions = img.shape[:2]
+            nuke.tprint(f"Stored image dimensions: {cls._image_dimensions}")
+
+        # Verify dimensions match
+        if img.shape[:2] != cls._image_dimensions:
+            nuke.tprint(f"Warning: Image dimensions mismatch. Expected {cls._image_dimensions}, got {img.shape[:2]}")
+
+        # Cache management - remove oldest entry if cache is full
+        if len(cls._image_cache) >= cls._cache_size:
+            # Remove the oldest entry
+            oldest_key = next(iter(cls._image_cache))
+            del cls._image_cache[oldest_key]
+
+        # Add to cache
+        cls._image_cache[frame_path] = img
+        return img
+
+    @classmethod
+    def _preload_next_frame(cls, current_frame):
+        """Preload the next frame in a background thread"""
+        if current_frame < cls.max_frame:
+            next_frame = current_frame + 1
+            next_frame_path = cls.get_frame_path(next_frame)
+
+            # Start preloading in a background thread
+            def preload():
+                cls._load_image(next_frame_path)
+            
+            threading.Thread(target=preload, daemon=True).start()
+
+    @classmethod
+    def get_frame_path(cls, frame_num):
+        """Get the path for a specific frame number"""
+        file_path = InputInfos.path
+        input_file_name = str(os.path.splitext(os.path.basename(file_path))[0])
+        if "%06d" in input_file_name:
+            return file_path.replace('%06d', str(f"{frame_num:06}"))
+        if "%05d" in input_file_name:
+            return file_path.replace('%05d', str(f"{frame_num:05}"))
+        if "%04d" in input_file_name:
+            return file_path.replace('%04d', str(f"{frame_num:04}"))
+        if "%03d" in input_file_name:
+            return file_path.replace('%03d', str(f"{frame_num:03}"))
+        if "%02d" in input_file_name:
+            return file_path.replace('%02d', str(f"{frame_num:02}"))
+        return file_path
+
+    @classmethod
+    def get_cover_scale_and_offset(cls, img_w, img_h, win_w=1280, win_h=720):
+        """Calculate scale and offset for image display"""
+        scale_cover = max(win_w / img_w, win_h / img_h) * cls._zoom_scale
+        new_w = int(img_w * scale_cover)
+        new_h = int(img_h * scale_cover)
+        sx = int((win_w - new_w) / 2 + cls._offset[0])
+        sy = int((win_h - new_h) / 2 + cls._offset[1])
+        return scale_cover, sx, sy
+
+    @classmethod
+    def _zoom_at_point(cls, img, scale, center_point):
+        """Zoom image at specific point"""
+        if scale == 1.0 or img is None:
+            return img.copy() if img is not None else None
+            
+        height, width = img.shape[:2]
+        
+        # Calculate new dimensions
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        
+        # Calculate the region to crop
+        x1 = max(0, int(center_point[0] - (new_width / 2)))
+        y1 = max(0, int(center_point[1] - (new_height / 2)))
+        x2 = min(width, x1 + new_width)
+        y2 = min(height, y1 + new_height)
+        
+        # Crop and resize
+        cropped = img[y1:y2, x1:x2]
+        zoomed = cv2.resize(cropped, (width, height))
+        return zoomed
 
     @classmethod
     def getBbox(cls):
@@ -231,22 +816,41 @@ class BoundingBox:
         cls.max_frame = int(nuke.thisNode().knob('FrameRangeMax').value())
         cls.current_frame = cls.min_frame
         cls.current_object_id = 0  # Initialize current object ID
+        cls._zoom_scale = 1.0  # Reset zoom scale
+        cls._zoom_center = None  # Reset zoom center
+        cls._offset = np.array([0, 0], dtype=np.float32)  # Reset pan offset
 
-        def get_frame_path(frame_num):
-            if "%04d" in input_file_name:
-                return file_path.replace('%04d', str(f"{frame_num:04}"))
-            elif "%03d" in input_file_name:
-                return file_path.replace('%03d', str(f"{frame_num:03}"))
-            return file_path
-
-        cls.input_path = get_frame_path(cls.current_frame)
+        cls.input_path = cls.get_frame_path(cls.current_frame)
         
         window_name = "Selection - Left/Right arrows to change frame, Left click and drag for box, 'p' for positive point, 'n' for negative point, 'z' to undo, 'r' to reset, 'q' to finish, '1-9' to select object ID"
         cv2.namedWindow(window_name, 0)
         cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
         cv2.resizeWindow(window_name, 1280, 720)
-
+        
         def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_MOUSEWHEEL:
+                # Handle zoom
+                if cls._last_loaded_image is not None:
+                    # Calculate zoom factor (positive for zoom in, negative for zoom out)
+                    zoom_factor = 1.1 if flags > 0 else 0.9
+                    
+                    # Update zoom scale
+                    cls._zoom_scale *= zoom_factor
+                    cls._zoom_scale = max(0.1, min(5.0, cls._zoom_scale))  # Limit zoom range
+                    
+                    # Update zoom center
+                    cls._zoom_center = (x, y)
+                    
+                    # Get zoomed image
+                    zoomed_img = cls._zoom_at_point(cls._last_loaded_image, cls._zoom_scale, cls._zoom_center)
+                    if zoomed_img is not None:
+                        # Draw current state
+                        if cls.current_box is not None:
+                            cv2.rectangle(zoomed_img, cls.current_box[0], cls.current_box[1], (0, 255, 0), 2)
+                        cv2.imshow(window_name, zoomed_img)
+                return
+
+            # Original mouse callback functionality
             if event == cv2.EVENT_MOUSEMOVE:
                 param['current_pos'] = (x, y)
                 if cls.drawing_box:
@@ -268,7 +872,7 @@ class BoundingBox:
                             prompt = Prompt()
                             prompt.frame_index = cls.current_frame
                             prompt.object_id = cls.current_object_id
-                            prompt.input_path = get_frame_path(cls.current_frame)  # Store input path
+                            prompt.input_path = cls.get_frame_path(cls.current_frame)  # Store input path
                             cls.prompts.append(prompt)
                         # Add bbox to prompt's list of bboxes
                         new_bbox = [cls.current_box[0], cls.current_box[1], 
@@ -281,11 +885,16 @@ class BoundingBox:
         # Dictionary to store current mouse position
         mouse_pos = {'current_pos': (0, 0)}
         cv2.setMouseCallback(window_name, mouse_callback, mouse_pos)
-
+        
         while True:
-            # Load current frame
-            current_img_path = get_frame_path(cls.current_frame)
-            img = cv2.imread(current_img_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            # Load current frame with caching
+            current_img_path = cls.get_frame_path(cls.current_frame)
+            img = cls._load_image(current_img_path)
+            
+            if img is None:
+                nuke.tprint(f"Error loading image for frame {cls.current_frame}")
+                break
+                
             img_with_boxes = img.copy()
 
             # Draw existing boxes and points for current frame
@@ -474,6 +1083,8 @@ class BoundingBox:
                 if cls.current_frame < cls.max_frame:
                     cls.current_frame += 1
                     nuke.tprint(f"Moving to frame {cls.current_frame}")
+                    # Preload next frame
+                    cls._preload_next_frame(cls.current_frame)
             
             elif key == 81 or key == 97:  # Left arrow key (←)
                 if cls.current_frame > cls.min_frame:
@@ -538,39 +1149,33 @@ class BoundingBox:
 
     @classmethod
     def send_to_api(cls):
+        """Format prompts for API with dimension information"""
+        if cls._image_dimensions is None:
+            # Get dimensions from first frame if not set
+            first_frame_path = cls.input_path
+            cls._image_dimensions = cls.get_image_dimensions(first_frame_path)
+            if cls._image_dimensions is None:
+                raise ValueError("Could not determine image dimensions")
+
         # Format prompts for API
-        prompts_data = []
+        formatted_prompts = []
         for prompt in cls.prompts:
-            # Validate data types before sending
-            prompt.validate_data_types()
             prompt_dict = {
                 "frame_index": prompt.frame_index,
                 "object_id": prompt.object_id,
-                "bbox": prompt.bboxes[0] if prompt.bboxes else None,  # Send first bbox if exists
+                "bboxes": prompt.bboxes,
                 "points_positive": prompt.points_positive,
                 "points_negative": prompt.points_negative
             }
-            prompts_data.append(prompt_dict)
+            formatted_prompts.append(prompt_dict)
 
-        # Convert paths for API
-        try:
-            video_path = convert_windows_to_linux_path(nuke.thisNode().knob('FilePath').value())
-            video_output_path = convert_windows_to_linux_path(nuke.thisNode().knob('OutputPath').getValue())
-            
-            # Send data to API
-            response = requests.post(
-                f"{API_BASE_URL}/api/{API_VERSION}/process_exr",
-                json={
-                    "prompts": prompts_data,
-                    "sequence_path": video_path,
-                    "output_path": video_output_path
-                }
-            )
-            response.raise_for_status()
-            result = response.json()
-            nuke.tprint(f"API response: {result}")
-        except Exception as e:
-            nuke.tprint(f"Error sending prompts to API: {str(e)}")
+        return {
+            "prompts": formatted_prompts,
+            "dimensions": {
+                "height": cls._image_dimensions[0],
+                "width": cls._image_dimensions[1]
+            }
+        }
 
 class InputInfos:
     read = None
@@ -619,7 +1224,7 @@ def UpdatePath():
 def check_api_server():
     """Check if the API server is running and accessible"""
     try:
-        response = requests.get(f"{API_BASE_URL}/api/{API_VERSION}/health")
+        response = requests.get(f"{get_api_base_url()}/api/{API_VERSION}/health")
         return response.status_code == 200
     except requests.exceptions.ConnectionError:
         return False
@@ -686,7 +1291,7 @@ def convert_windows_to_linux_path(windows_path):
             server = parts[0]
             share = parts[1]
             # Convert to /mnt/share format
-            return f"/mnt/shared/{'/'.join(parts[2:])}"
+            return f"/mnt/PTGData/shared/{'/'.join(parts[2:])}"
     
     # Handle local Windows paths (e.g., D:/path)
     if ':' in path:
@@ -695,7 +1300,7 @@ def convert_windows_to_linux_path(windows_path):
         # Remove leading slash if present
         rest = rest.lstrip('/')
         # Convert to network share format
-        return f"/mnt/shared/{rest}"
+        return f"/mnt/PTGData/shared/{rest}"
     
     return path
 
@@ -712,11 +1317,87 @@ def convert_linux_to_windows_path(linux_path):
     
     return linux_path
 
+def create_read_node(video_output_path, frame_range, is_zip=False, file_path=None):
+    """
+    Create a read node for the processed mask sequence.
+    
+    Args:
+        video_output_path (str): Path to the output file or directory
+        frame_range (list): List containing [start_frame, end_frame]
+        is_zip (bool): Whether the output is a zip file
+        file_path (str): Original input file path to extract prefix
+    
+    Returns:
+        nuke.Node: The created read node
+    """
+    try:
+        if is_zip:
+            normalized_path = normalize_path(video_output_path)
+            read_node = nuke.nodes.Read(file=normalized_path, first=frame_range[0], last=frame_range[1]-1)
+        else:
+            # Verify output dimensions match input
+            if BoundingBox._image_dimensions is not None:
+                # Get first output frame
+                extract_dir = os.path.dirname(video_output_path)
+                first_output_frame = os.path.join(extract_dir, f"mask_{frame_range[0]:04d}.exr")
+                if os.path.exists(first_output_frame):
+                    output_img = cv2.imread(first_output_frame)
+                    if output_img is not None:
+                        output_dims = output_img.shape[:2]
+                        if output_dims != BoundingBox._image_dimensions:
+                            nuke.message(f"Warning: Output dimensions ({output_dims}) don't match input dimensions ({BoundingBox._image_dimensions})")
+                            nuke.tprint(f"Dimension mismatch - Input: {BoundingBox._image_dimensions}, Output: {output_dims}")
+            
+            # Extract prefix from input file path
+            if file_path:
+                # Get the filename without extension
+                base_name = os.path.splitext(os.path.basename(file_path))[0]
+                # Construct mask pattern using the prefix
+                extract_dir = os.path.dirname(video_output_path)
+                
+                # Try to find a frame padding pattern in the input file path
+                match = re.search(r'(#+|%0?(\d+)d)', file_path)
+                if match:
+                    if '#' in match.group(1):
+                        num_digits = len(match.group(1))
+                    else:
+                        num_digits = int(match.group(2))
+                else:
+                    num_digits = 4  # Default to 4 if not found
+
+                prefix = base_name.rsplit('_', 1)[0]
+                mask_pattern = os.path.join(extract_dir, f"{prefix}_mask_%0{num_digits}d.exr")
+            else:
+                # Fallback to default pattern if no file_path provided
+                extract_dir = os.path.dirname(video_output_path)
+                mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
+            
+            # Normalize the path
+            normalized_pattern = normalize_path(mask_pattern)
+            read_node = nuke.nodes.Read(file=normalized_pattern, first=frame_range[0], last=frame_range[1]-1)
+            
+            # Update status to complete
+            nuke.executeInMainThread(lambda: update_status_safely("Processing complete"))
+            nuke.executeInMainThread(lambda: reset_ui_state())
+            
+            nuke.message("Mask generation completed! Files saved and loaded into Nuke.")
+        
+        return read_node
+    except Exception as e:
+        error_msg = f"Error creating read node: {str(e)}"
+        nuke.tprint(error_msg)
+        nuke.message(error_msg)
+        raise
+
 def GenerateMask():
     # Upgrade the node if needed (for backwards compatibility)
     upgrade_node_if_needed()
     
+    # Set API URL from node configuration
+    set_api_base_url()
+    
     Output_path = nuke.thisNode().knob('OutputPath').getValue()
+    File_path = nuke.thisNode().knob('FilePath').value()
 
     # Checks
     if str(os.path.splitext(os.path.basename(Output_path))[0]) == '':
@@ -728,8 +1409,11 @@ def GenerateMask():
         return
         
     if nuke.thisNode().knob('FileType').value() == "exr":
-        if ("%04d" not in Output_path) and ("%03d" not in Output_path):
-            nuke.message("Your file must contains '####' or '###'")
+        # Check for valid frame padding patterns (3 to 10 digits)
+        valid_patterns = ['%03d', '%04d', '%05d', '%06d', '%07d', '%08d', '%09d', '%10d']
+        has_valid_pattern = any(pattern in Output_path for pattern in valid_patterns)
+        if not has_valid_pattern:
+            nuke.message("Your file must contain a frame padding pattern (### to ##########)")
             return
 
     if not BoundingBox.prompts:
@@ -738,7 +1422,7 @@ def GenerateMask():
 
     # Check if API server is running
     if not check_api_server():
-        nuke.message("Error: API server is not running. Please ensure the server is running at " + API_BASE_URL)
+        nuke.message("Error: API server is not running. Please ensure the server is running at " + get_api_base_url())
         return
 
     # Reset progress bar and status message
@@ -746,7 +1430,7 @@ def GenerateMask():
     
     # Get all required parameters
     video_path = convert_windows_to_linux_path(nuke.thisNode().knob('FilePath').value())
-    video_output_path = convert_windows_to_linux_path(nuke.thisNode().knob('OutputPath').getValue())
+    video_output_path = nuke.thisNode().knob('OutputPath').getValue()
     save_to_file = nuke.thisNode().knob('FileType').value()
     frame_range = [int(nuke.thisNode().knob('FrameRangeMin').value()),
                   int(nuke.thisNode().knob('FrameRangeMax').value() + 1)]
@@ -760,9 +1444,9 @@ def GenerateMask():
     def load_model():
         nuke.tprint("Loading model in background...")
         response = requests.post(
-            f"{API_BASE_URL}/api/{API_VERSION}/models/load",
+            f"{get_api_base_url()}/api/{API_VERSION}/models/load",
             json={"model_type": model_type},
-            timeout=30
+            timeout=300  # 5 minutes timeout
         )
         response.raise_for_status()
         return model_type
@@ -791,22 +1475,35 @@ def GenerateMask():
             }
             validated_prompts.append(prompt_dict)
         
+        # Get dimensions from BoundingBox class
+        if BoundingBox._image_dimensions is None:
+            # Get dimensions from first frame if not set
+            first_frame_path = get_frame_path(frame_range[0])
+            BoundingBox._image_dimensions = BoundingBox.get_image_dimensions(first_frame_path)
+            if BoundingBox._image_dimensions is None:
+                raise ValueError("Could not determine image dimensions")
+        
         request_data = {
             "sequence_path": video_path,
             "frame_range": frame_range,
             "prompts": validated_prompts,
             "bits": bits,
             "original_fps": original_fps,
-            "target_fps": target_fps
+            "target_fps": target_fps,
+            "dimensions": {
+                "height": BoundingBox._image_dimensions[0],
+                "width": BoundingBox._image_dimensions[1]
+            }
         }
 
         nuke.tprint("Sending sequence to API for processing...")
         nuke.tprint(f"Using paths - Input: {video_path}")
+        nuke.tprint(f"Image dimensions: {BoundingBox._image_dimensions}")
         nuke.tprint(f"Request data: {json.dumps(request_data, indent=2)}")  # Debug print
         
         # Send request to process_sequence endpoint
         response = requests.post(
-            f"{API_BASE_URL}/api/{API_VERSION}/process_sequence?as_file=true",
+            f"{get_api_base_url()}/api/{API_VERSION}/process_sequence?as_file=true",
             json=request_data,
             timeout=300  # 5 minutes timeout
         )
@@ -822,7 +1519,7 @@ def GenerateMask():
             process_task.start_progress_monitor(task_id)
             
             # Poll for completion and download results
-            output_endpoint = f"{API_BASE_URL}/api/{API_VERSION}/output/{task_id}"
+            output_endpoint = f"{get_api_base_url()}/api/{API_VERSION}/output/{task_id}"
             max_attempts = 60  # 5 minutes at 5-second intervals
             attempt = 0
             error_count = 0
@@ -832,244 +1529,81 @@ def GenerateMask():
                 try:
                     output_response = requests.get(output_endpoint, timeout=5)
                     if output_response.status_code == 200:
-                        error_count = 0  # Reset error count on success
-                        output_data = output_response.json()
+                        # Download the ZIP file
+                        download_url = f"{get_api_base_url()}/api/{API_VERSION}/download_all/{task_id}"
+                        download_response = requests.get(download_url, stream=True)
+                        download_response.raise_for_status()
                         
-                        # Find the ZIP file
-                        zip_file = None
-                        for file_info in output_data.get("files", []):
-                            if file_info["filename"].endswith(".zip"):
-                                zip_file = file_info
-                                break
+                        # Get file size for progress tracking
+                        file_size = int(download_response.headers.get('content-length', 0))
+                        total_downloaded = 0
+                        
+                        # Save the ZIP file
+                        with open(video_output_path, 'wb') as f:
+                            for i, chunk in enumerate(download_response.iter_content(chunk_size=8192)):
+                                f.write(chunk)
+                                total_downloaded += len(chunk)
+                                # Update progress every 20 chunks
+                                if i % 20 == 0:
+                                    if file_size > 0:
+                                        # Calculate download progress (90-95%)
+                                        download_progress = 90 + (total_downloaded / file_size) * 5
+                                        nuke.executeInMainThread(lambda p=download_progress: update_status_safely(f"Download progress: {int(p)}%"))
+                                    else:
+                                        # If file size unknown, just show intermediate progress
+                                        nuke.executeInMainThread(lambda: update_status_safely("Downloading..."))
+                        
+                        # Always make sure we're at 95% after download
+                        nuke.executeInMainThread(lambda: update_status_safely("Download complete, extracting files..."))
+                        
+                        # Extract if needed
+                        if not video_output_path.lower().endswith('.zip'):
+                            extract_dir = os.path.dirname(video_output_path)
+                            with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
+                                # Get total number of files for progress tracking
+                                file_count = len(zip_ref.infolist())
                                 
-                        if zip_file:
-                            # Found ZIP file, download it
-                            download_url = f"{API_BASE_URL}/api/{API_VERSION}/download/{zip_file['filename']}"
-                            nuke.executeInMainThread(lambda: update_status_safely("Preparing to download result files..."))
-                            
-                            # Get file size if available for progress tracking
-                            file_size = zip_file.get('size', 0)
-                            
-                            # Download with progress tracking
-                            nuke.executeInMainThread(lambda: update_status_safely("Downloading result files..."))
-                            download_response = requests.get(download_url, stream=True, timeout=60)
-                            download_response.raise_for_status()
-                            
-                            # Create output directory
-                            output_dir = os.path.dirname(video_output_path)
-                            if output_dir and not os.path.exists(output_dir):
-                                os.makedirs(output_dir, exist_ok=True)
-                            
-                            # Save to file with progress tracking
-                            total_downloaded = 0
-                            with open(video_output_path, 'wb') as f:
-                                for i, chunk in enumerate(download_response.iter_content(chunk_size=8192)):
-                                    f.write(chunk)
-                                    total_downloaded += len(chunk)
-                                    # Update progress every 20 chunks
-                                    if i % 20 == 0:
-                                        if file_size > 0:
-                                            # Calculate download progress (90-95%)
-                                            download_progress = 90 + (total_downloaded / file_size) * 5
-                                            nuke.executeInMainThread(lambda p=download_progress: update_status_safely(f"Download progress: {int(p)}%"))
-                                        else:
-                                            # If file size unknown, just show intermediate progress
-                                            nuke.executeInMainThread(lambda: update_status_safely("Downloading..."))
-            
-                            # Always make sure we're at 95% after download
-                            nuke.executeInMainThread(lambda: update_status_safely("Download complete, extracting files..."))
-                            
-                            # Extract if needed
-                            if not video_output_path.lower().endswith('.zip'):
-                                extract_dir = os.path.dirname(video_output_path)
-                                with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
-                                    # Get total number of files for progress tracking
-                                    file_count = len(zip_ref.infolist())
+                                # Extract files with progress tracking
+                                for i, file in enumerate(zip_ref.infolist()):
+                                    zip_ref.extract(file, extract_dir)
+                                    # Update extraction progress (95-98%)
+                                    if i % max(1, file_count // 10) == 0:  # Update 10 times total
+                                        extraction_progress = 95 + (i / file_count) * 3
+                                        nuke.executeInMainThread(lambda p=extraction_progress: update_status_safely(f"Extraction progress: {int(p)}%"))
                                     
-                                    # Extract files with progress tracking
-                                    for i, file in enumerate(zip_ref.infolist()):
-                                        zip_ref.extract(file, extract_dir)
-                                        # Update extraction progress (95-98%)
-                                        if i % max(1, file_count // 10) == 0:  # Update 10 times total
-                                            extraction_progress = 95 + (i / file_count) * 3
-                                            nuke.executeInMainThread(lambda p=extraction_progress: update_status_safely(f"Extraction progress: {int(p)}%"))
-                                        
-                                        # Show filename being extracted every 10 files
-                                        if i % 10 == 0:
-                                            nuke.executeInMainThread(lambda f=file.filename: 
-                                                update_status_safely(f"Extracting: {f}"))
-                                
-                                # Delete the ZIP file
-                                os.remove(video_output_path)
-                                nuke.executeInMainThread(lambda: update_status_safely("Extraction complete"))
+                                    # Show filename being extracted every 10 files
+                                    if i % 10 == 0:
+                                        nuke.executeInMainThread(lambda f=file.filename: 
+                                            update_status_safely(f"Extracting: {f}"))
                             
-                            # Always make sure we're at 98% after extraction
-                            nuke.executeInMainThread(lambda: update_status_safely("Setting up read node..."))
-                            
-                            # Create a read node in the main thread
-                            def create_read_node():
-                                if video_output_path.endswith('.zip'):
-                                    normalized_path = normalize_path(video_output_path)
-                                    read_node = nuke.nodes.Read(file=normalized_path, first=frame_range[0], last=frame_range[1]-1)
-                                else:
-                                    # Find mask pattern
-                                    extract_dir = os.path.dirname(video_output_path)
-                                    mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
-                                    # Normalize the path
-                                    normalized_pattern = normalize_path(mask_pattern)
-                                    read_node = nuke.nodes.Read(file=normalized_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
-                                
-                                # Mark as 100% complete
-                                update_status_safely("Processing completed successfully")
-                                
-                                nuke.message("Mask generation completed! Files saved and loaded into Nuke.")
-                                
-                            nuke.executeInMainThread(create_read_node)
-                            return
-                        else:
-                            # No ZIP file yet, keep waiting
-                            time.sleep(5)
-                    elif output_response.status_code in [404, 503]:
-                        error_count += 1
-                        if error_count >= max_error_count:
-                            nuke.executeInMainThread(lambda: nuke.message(f"Task output unavailable (status {output_response.status_code}) for {error_count} attempts. Stopping."))
-                            break
-                        time.sleep(5)
+                            # Delete the ZIP file
+                            os.remove(video_output_path)
+                            nuke.executeInMainThread(lambda: update_status_safely("Extraction complete"))
+                        
+                        # Always make sure we're at 98% after extraction
+                        nuke.executeInMainThread(lambda: update_status_safely("Setting up read node..."))
+                        
+                        # Create read node in main thread
+                        try:
+                            nuke.executeInMainThread(lambda: create_read_node(video_output_path, frame_range, video_output_path.endswith('.zip'), video_path))
+                        except Exception as e:
+                            error_msg = f"Error executing in main thread: {str(e)}"
+                            nuke.tprint(error_msg)
+                            nuke.message(error_msg)
+                            process_task.report_error(error_msg)
+                        return
                     else:
+                        # No ZIP file yet, keep waiting
                         time.sleep(5)
                 except Exception as e:
-                    nuke.tprint(f"Error checking task output: {str(e)}")
+                    error_count += 1
+                    if error_count >= max_error_count:
+                        error_msg = f"Error downloading result: {str(e)}"
+                        nuke.tprint(error_msg)
+                        nuke.executeInMainThread(lambda: nuke.message(error_msg))
+                        process_task.report_error(error_msg)
+                        return
                     time.sleep(5)
-            
-            # If we get here, we haven't found a ZIP file yet
-            # Try the download_all endpoint as a last resort
-            try:
-                download_url = f"{API_BASE_URL}/api/{API_VERSION}/download_all/{task_id}"
-                nuke.executeInMainThread(lambda: update_status_safely("Trying direct download of all result files..."))
-                
-                download_response = requests.get(download_url, stream=True, timeout=60)
-                
-                if download_response.status_code == 200:
-                    # Create output directory
-                    output_dir = os.path.dirname(video_output_path)
-                    if output_dir and not os.path.exists(output_dir):
-                        os.makedirs(output_dir, exist_ok=True)
-                    
-                    # Save all files as ZIP with progress tracking
-                    total_size = int(download_response.headers.get('content-length', 0))
-                    total_downloaded = 0
-                    
-                    with open(video_output_path, 'wb') as f:
-                        for i, chunk in enumerate(download_response.iter_content(chunk_size=8192)):
-                            f.write(chunk)
-                            total_downloaded += len(chunk)
-                            # Update progress every 20 chunks
-                            if i % 20 == 0:
-                                if total_size > 0:
-                                    # Calculate download progress (90-95%)
-                                    download_progress = 90 + (total_downloaded / total_size) * 5
-                                    nuke.executeInMainThread(lambda p=download_progress: update_status_safely(f"Download progress: {int(p)}%"))
-                                else:
-                                    # If file size unknown, just show intermediate progress
-                                    nuke.executeInMainThread(lambda: update_status_safely("Downloading..."))
-                    
-                    nuke.executeInMainThread(lambda: update_status_safely("Direct download complete, extracting files..."))
-                    
-                    # Extract if needed
-                    if not video_output_path.lower().endswith('.zip'):
-                        extract_dir = os.path.dirname(video_output_path)
-                        with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
-                            # Get total number of files for progress tracking
-                            file_count = len(zip_ref.infolist())
-                            
-                            # Extract files with progress tracking
-                            for i, file in enumerate(zip_ref.infolist()):
-                                zip_ref.extract(file, extract_dir)
-                                # Update extraction progress (95-98%)
-                                if i % max(1, file_count // 10) == 0:  # Update 10 times total
-                                    extraction_progress = 95 + (i / file_count) * 3
-                                    nuke.executeInMainThread(lambda p=extraction_progress: update_status_safely(f"Extraction progress: {int(p)}%"))
-                                
-                                # Show filename being extracted every 10 files
-                                if i % 10 == 0:
-                                    nuke.executeInMainThread(lambda f=file.filename: 
-                                        update_status_safely(f"Extracting: {f}"))
-                        
-                        # Delete the ZIP file
-                        os.remove(video_output_path)
-                    
-                    nuke.executeInMainThread(lambda: update_status_safely("Finalizing..."))
-                    
-                    # Create read node
-                    def create_read_node():
-                        if video_output_path.endswith('.zip'):
-                            normalized_path = normalize_path(video_output_path)
-                            read_node = nuke.nodes.Read(file=normalized_path, first=frame_range[0], last=frame_range[1]-1)
-                        else:
-                            # Find mask pattern
-                            extract_dir = os.path.dirname(video_output_path)
-                            mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
-                            # Normalize the path
-                            normalized_pattern = normalize_path(mask_pattern)
-                            read_node = nuke.nodes.Read(file=normalized_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
-                        nuke.message("Mask generation completed! Files saved and loaded into Nuke.")
-                    
-                    nuke.executeInMainThread(create_read_node)
-            except Exception as e:
-                nuke.tprint(f"Error downloading all files: {str(e)}")
-                nuke.executeInMainThread(lambda e=e: nuke.message(f"Error downloading result: {str(e)}"))
-                # Mark error and set the error flag
-                process_task.report_error(f"Error downloading result: {str(e)}")
-        
-        # If we get here with a result but no task_id, it's an immediate result
-        elif "result" in result:
-            nuke.tprint("Processing completed successfully with immediate result")
-            
-            # Handle different response formats
-            if save_to_file and "output_dir" in result and "zip_path" in result:
-                # Server saved files, download the ZIP
-                zip_path = result["zip_path"]
-                try:
-                    download_url = f"{API_BASE_URL}/api/{API_VERSION}/download/{os.path.basename(zip_path)}"
-                    download_response = requests.get(download_url, stream=True)
-                    
-                    # Create output directory
-                    output_dir = os.path.dirname(video_output_path)
-                    if output_dir and not os.path.exists(output_dir):
-                        os.makedirs(output_dir, exist_ok=True)
-                    
-                    # Save to file
-                    with open(video_output_path, 'wb') as f:
-                        for chunk in download_response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    
-                    # Extract if needed
-                    if not video_output_path.lower().endswith('.zip'):
-                        extract_dir = os.path.dirname(video_output_path)
-                        with zipfile.ZipFile(video_output_path, 'r') as zip_ref:
-                            zip_ref.extractall(extract_dir)
-                        
-                        # Delete the ZIP file
-                        os.remove(video_output_path)
-                    
-                    # Create read node in main thread
-                    def create_read_node():
-                        if video_output_path.endswith('.zip'):
-                            normalized_path = normalize_path(video_output_path)
-                            read_node = nuke.nodes.Read(file=normalized_path, first=frame_range[0], last=frame_range[1]-1)
-                        else:
-                            # Find mask pattern
-                            extract_dir = os.path.dirname(video_output_path)
-                            mask_pattern = os.path.join(extract_dir, "mask_%04d.exr")
-                            # Normalize the path
-                            normalized_pattern = normalize_path(mask_pattern)
-                            read_node = nuke.nodes.Read(file=normalized_pattern, first=0, last=frame_range[1]-frame_range[0]-1)
-                        nuke.message("Mask generation completed! Files saved and loaded into Nuke.")
-                    
-                    nuke.executeInMainThread(create_read_node)
-                except Exception as e:
-                    nuke.tprint(f"Error downloading result: {str(e)}")
-                    nuke.executeInMainThread(lambda: nuke.message(f"Error downloading result: {str(e)}"))
     
     # Function to handle processing errors
     def on_process_error(error):
@@ -1077,6 +1611,7 @@ def GenerateMask():
     
     # Create the threaded task for sequence processing
     process_task = ThreadedTask(
+        on_complete=lambda: None,
         on_progress=lambda p, m: update_status_safely(f"Progress: {int(p)}% - {m}"),
         on_error=on_process_error
     )
@@ -1084,6 +1619,7 @@ def GenerateMask():
     # Create the threaded task for model loading
     model_task = ThreadedTask(
         on_complete=on_model_loaded,
+        on_progress=lambda p, m: update_status_safely(f"Loading model: {int(p)}% - {m}"),
         on_error=on_model_error
     )
     
@@ -1099,7 +1635,10 @@ def reset_model_state():
         update_status_safely("Resetting model state...")
         
         # Make API call to reset endpoint
-        response = requests.post(f"{API_BASE_URL}/api/{API_VERSION}/reset")
+        response = requests.post(
+            f"{get_api_base_url()}/api/{API_VERSION}/reset",
+            timeout=60  # 1 minute timeout
+        )
         try:
             response.raise_for_status()  # Raise exception for non-200 status codes
         except Exception as e:
@@ -1145,6 +1684,23 @@ def CreateSAM2Node():
 
     # Adding knobs
     s.knob('name').setValue('SAM2')
+    
+    # Server Management
+    s.addKnob(nuke.Text_Knob('ServerStatus', 'Server Status'))
+    s.knob('ServerStatus').setEnabled(False)
+    s.knob('ServerStatus').setValue("Checking...")
+    
+    s.addKnob(nuke.PyScript_Knob('StartServer', 'Start Server', 'start_docker_server()'))
+    s.addKnob(nuke.PyScript_Knob('StopServer', 'Stop Server', 'stop_docker_server()'))
+    s.knob('StartServer').setFlag(nuke.STARTLINE)
+    
+    # API Configuration
+    s.addKnob(nuke.String_Knob('APIBaseURL', 'API Base URL'))
+    s.knob('APIBaseURL').setValue(API_BASE_URL)
+    s.knob('APIBaseURL').setTooltip("Base URL for the SAM2 API server (e.g., http://localhost:8000)")
+    s.addKnob(nuke.PyScript_Knob('SetAPIURL', 'Set', 'set_api_base_url()'))
+    s.knob('SetAPIURL').setFlag(nuke.STARTLINE)
+    
     s.addKnob(nuke.File_Knob('FilePath', 'File Path'))
     s.addKnob(nuke.PyScript_Knob('UpdatePath', 'Update Path', 'UpdatePath()'))
     
@@ -1152,6 +1708,11 @@ def CreateSAM2Node():
     s.addKnob(nuke.Int_Knob("FrameRangeMin", 'Frame Range'))
     s.addKnob(nuke.Int_Knob("FrameRangeMax", ' '))
     s.addKnob(nuke.Int_Knob("FPS", 'Output Frame Rate'))
+    
+    # Add auto-update frame range knob
+    s.addKnob(nuke.Boolean_Knob('AutoUpdateFrameRange', 'Auto Update Frame Range'))
+    s.knob('AutoUpdateFrameRange').setValue(True)
+    s.knob('AutoUpdateFrameRange').setTooltip("Automatically update frame range based on input node")
     
     # Model selection - user-friendly names
     s.addKnob(nuke.Enumeration_Knob('ModelType', 'Model type', ['Base', 'Large', 'Small', 'Tiny']))
@@ -1181,8 +1742,9 @@ def CreateSAM2Node():
     s.addKnob(nuke.Text_Knob('', ''))
     
     # Output controls
-    s.addKnob(nuke.Enumeration_Knob('FileType', 'File type', ['exr', 'mp4']))
+    s.addKnob(nuke.Enumeration_Knob('FileType', 'File type', ['exr']))
     s.addKnob(nuke.File_Knob('OutputPath', 'Output Path'))
+    s.knob('OutputPath').setTooltip("path/to/your/file_####.exr (supports ### to ########## for frame padding)")
     s.addKnob(nuke.PyScript_Knob('GenerateMask', 'Generate Mask', 'GenerateMask()'))
     
     # Add divider
@@ -1208,9 +1770,54 @@ def CreateSAM2Node():
     s['ResetState'].setTooltip("Reset model state and clear GPU memory")
     s['FPS'].setTooltip("Target FPS for the output video")
     s['ModelType'].setTooltip("Choose your model type: Base, Large, Small, or Tiny")
-    s['OutputPath'].setTooltip("path/to/your/file_####.exr, to create an image sequence add #### or ###")
+    s['OutputPath'].setTooltip("path/to/your/file_####.exr (supports ### to ########## for frame padding)")
     s['GenerateMask'].setTooltip("Generate Mask")
     s['StatusMessage'].setTooltip("Current processing status")
+    s['AutoUpdateFrameRange'].setTooltip("Automatically update frame range based on input node")
+
+    # Add callback for auto-updating frame range
+    s.addKnob(nuke.PyScript_Knob('updateFrameRange', 'Update Frame Range', 'update_frame_range()'))
+    s.knob('updateFrameRange').setVisible(False)
+    
+    # Add callback for input changes
+    def on_knob_changed():
+        if nuke.thisKnob().name() == 'inputChange':
+            update_frame_range()
+    
+    s.addKnob(nuke.PyScript_Knob('onKnobChanged', 'On Knob Changed', 'on_knob_changed()'))
+    s.knob('onKnobChanged').setVisible(False)
+    
+    # Register the callback
+    nuke.addKnobChanged(on_knob_changed, node=s)
+
+def update_frame_range():
+    """Update frame range based on input node"""
+    try:
+        node = nuke.thisNode()
+        if not node:
+            return
+            
+        # Check if the node has the required knobs
+        if not node.knob('AutoUpdateFrameRange'):
+            return
+            
+        if not node.knob('AutoUpdateFrameRange').value():
+            return
+            
+        input_node = node.input(0)
+        if input_node and input_node.Class() == 'Read':
+            node.knob('FrameRangeMin').setValue(int(input_node.knob('first').value()))
+            node.knob('FrameRangeMax').setValue(int(input_node.knob('last').value()))
+            node.knob('FilePath').setValue(input_node.knob('file').value())
+    except Exception as e:
+        nuke.tprint(f"Error updating frame range: {str(e)}")
+
+def on_input_changed():
+    """Callback when input node changes"""
+    try:
+        update_frame_range()
+    except Exception as e:
+        nuke.tprint(f"Error in input changed callback: {str(e)}")
 
 def update_status_safely(message):
     """Safely update status message, handling cases where knob might be missing"""
@@ -1236,14 +1843,93 @@ def reset_ui_state():
     update_status_safely("Idle - Ready to process")
     nuke.tprint("Reset UI state")
 
-async def monitor_progress(task_id):
-    """This function is kept for backward compatibility but is no longer used.
-       Progress monitoring is now handled by the ThreadedTask class."""
-    nuke.tprint("Warning: Deprecated monitor_progress function called. Please update your code to use ThreadedTask.")
-    pass
+async def connect_with_retry(uri, max_retries=5, initial_delay=1):
+    retry_count = 0
+    delay = initial_delay
+
+    while retry_count < max_retries:
+        try:
+            nuke.executeInMainThread(lambda: nuke.tprint(f"Attempting WebSocket connection (attempt {retry_count + 1}/{max_retries})..."))
+            async with websockets.connect(uri, ping_timeout=20, close_timeout=10) as websocket:
+                nuke.executeInMainThread(lambda: nuke.tprint("WebSocket connection established successfully"))
+                return websocket
+        except Exception as e:
+            retry_count += 1
+            nuke.executeInMainThread(lambda e=e, retry_count=retry_count, max_retries=max_retries: 
+                nuke.tprint(f"WebSocket connection failed (attempt {retry_count}/{max_retries}): {e}"))
+            if retry_count < max_retries:
+                await asyncio.sleep(delay)
+                delay *= 2  # Exponential backoff
+            else:
+                nuke.executeInMainThread(lambda: nuke.tprint("Max retries reached, falling back to HTTP polling"))
+                return None
+
+async def monitor_progress(uri):
+    """Monitor progress using WebSocket with HTTP polling fallback"""
+    websocket = await connect_with_retry(uri)
+    if not websocket:
+        # Start HTTP polling monitor
+        task_id = uri.split('/')[-1]  # Extract task_id from WebSocket URI
+        return start_polling_monitor(
+            task_id,
+            on_progress=lambda p, m: nuke.executeInMainThread(lambda: nuke.tprint(f"Progress: {p}% - {m}")),
+            on_error=lambda e: nuke.executeInMainThread(lambda: nuke.tprint(f"Error: {e}")),
+            on_complete=lambda: nuke.executeInMainThread(lambda: nuke.tprint("Processing completed successfully"))
+        )
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.recv(), timeout=30)
+                progress_data = json.loads(data)
+                progress = int(progress_data.get('progress', 0))
+                message = progress_data.get('message', '')
+                status = progress_data.get('status', 'running')
+                
+                nuke.executeInMainThread(lambda p=progress, m=message: nuke.tprint(f"Progress: {p}% - {m}"))
+                
+                if status in ['completed', 'failed']:
+                    if status == 'completed':
+                        nuke.executeInMainThread(lambda: nuke.tprint("Processing completed successfully"))
+                    else:
+                        error = progress_data.get('error', 'Unknown error')
+                        nuke.executeInMainThread(lambda e=error: nuke.tprint(f"Task failed: {e}"))
+                    break
+                    
+            except asyncio.TimeoutError:
+                try:
+                    pong_event = await websocket.ping()
+                    await asyncio.wait_for(pong_event, timeout=5)
+                    nuke.executeInMainThread(lambda: nuke.tprint("WebSocket ping successful, connection still active"))
+                except (asyncio.TimeoutError, Exception) as e:
+                    nuke.executeInMainThread(lambda e=e: nuke.tprint(f"WebSocket connection lost: {e}"))
+                    # Extract task_id and start HTTP polling
+                    task_id = uri.split('/')[-1]
+                    return start_polling_monitor(
+                        task_id,
+                        on_progress=lambda p, m: nuke.executeInMainThread(lambda: nuke.tprint(f"Progress: {p}% - {m}")),
+                        on_error=lambda e: nuke.executeInMainThread(lambda: nuke.tprint(f"Error: {e}")),
+                        on_complete=lambda: nuke.executeInMainThread(lambda: nuke.tprint("Processing completed successfully"))
+                    )
+                    
+    except Exception as e:
+        nuke.executeInMainThread(lambda e=e: nuke.tprint(f"WebSocket error: {e}"))
+        # Extract task_id and start HTTP polling
+        task_id = uri.split('/')[-1]
+        return start_polling_monitor(
+            task_id,
+            on_progress=lambda p, m: nuke.executeInMainThread(lambda: nuke.tprint(f"Progress: {p}% - {m}")),
+            on_error=lambda e: nuke.executeInMainThread(lambda: nuke.tprint(f"Error: {e}")),
+            on_complete=lambda: nuke.executeInMainThread(lambda: nuke.tprint("Processing completed successfully"))
+        )
+    finally:
+        await websocket.close()
 
 # Register functions for Nuke PyScript_Knobs
 import __main__
 __main__.reset_model_state = reset_model_state
 __main__.CreateSAM2Node = CreateSAM2Node
+__main__.set_api_base_url = set_api_base_url
+__main__.start_docker_server = start_docker_server
+__main__.stop_docker_server = stop_docker_server
 # (Add any other functions you want to call from knobs) 

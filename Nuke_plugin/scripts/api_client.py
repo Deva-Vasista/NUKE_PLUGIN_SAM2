@@ -7,15 +7,21 @@ import Imath
 import numpy as np
 import nuke
 import json
+from NukeSAM2 import get_api_base_url
 
 class NukeSamuraiClient:
-    def __init__(self, api_url="http://localhost:8000"):
-        self.api_url = api_url
+    def __init__(self, api_url=None):
+        self.api_url = api_url or get_api_base_url()
         self.session = requests.Session()
+        
+    def update_api_url(self):
+        """Update the API URL from the node configuration"""
+        self.api_url = get_api_base_url()
         
     def check_health(self):
         """Check if the API server is healthy"""
         try:
+            self.update_api_url()  # Update URL before making request
             response = self.session.get(f"{self.api_url}/health")
             response.raise_for_status()
             return response.json()
@@ -107,27 +113,82 @@ class NukeSamuraiClient:
                 "prompts": validated_prompts,
                 "bits": bits,
                 "original_fps": float(original_fps),
-                "target_fps": float(target_fps)
+                "target_fps": float(target_fps),
+                "chunk_size": 20  # Match backend chunk size
             }
             
             # Log the request for debugging
             nuke.tprint(f"Sending sequence request: {json.dumps(request_data, indent=2)}")
             
-            # Send request
+            # Send request with increased timeout for large sequences
             response = self.session.post(
                 f"{self.api_url}/api/v1/process_sequence?as_file=true",
-                json=request_data
+                json=request_data,
+                timeout=300  # 5 minutes timeout
             )
             response.raise_for_status()
             
-            # Save the result to a temporary file
+            # Check for task_id in response
+            result = response.json()
+            if "task_id" in result:
+                nuke.tprint(f"Processing started with task ID: {result['task_id']}")
+                return result["task_id"]
+            
+            # If no task_id, this is an immediate result
             with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
                 tmp.write(response.content)
                 return tmp.name
                 
+        except requests.exceptions.Timeout:
+            error_msg = "Request timed out. The sequence might be too large or the server is busy."
+            nuke.tprint(error_msg)
+            raise Exception(error_msg)
+        except requests.exceptions.ConnectionError:
+            error_msg = "Failed to connect to the server. Please check if the server is running."
+            nuke.tprint(error_msg)
+            raise Exception(error_msg)
         except Exception as e:
-            nuke.message(f"Error processing sequence: {str(e)}")
+            error_msg = f"Error processing sequence: {str(e)}"
+            nuke.tprint(error_msg)
+            raise Exception(error_msg)
+            
+    def get_task_status(self, task_id):
+        """Get the current status of a processing task"""
+        try:
+            response = self.session.get(f"{self.api_url}/api/v1/status/{task_id}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            nuke.tprint(f"Error getting task status: {str(e)}")
             return None
+            
+    def download_task_output(self, task_id, output_path):
+        """Download the output files for a completed task"""
+        try:
+            # First try to get all files as a ZIP
+            response = self.session.get(
+                f"{self.api_url}/api/v1/download_all/{task_id}",
+                stream=True,
+                timeout=300  # 5 minutes timeout
+            )
+            response.raise_for_status()
+            
+            # Create output directory if it doesn't exist
+            output_dir = os.path.dirname(output_path)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+            
+            # Save the ZIP file
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    
+            return output_path
+            
+        except Exception as e:
+            error_msg = f"Error downloading task output: {str(e)}"
+            nuke.tprint(error_msg)
+            raise Exception(error_msg)
             
     def create_mask_node(self, exr_path):
         """Create a Nuke node with the processed mask"""

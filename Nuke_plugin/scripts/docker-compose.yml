@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  nuke-samurai-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nuke-samurai-api:latest
+    container_name: nuke-samurai-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Set to 'cpu' if no GPU is available
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      # Set to 'true' to enable debug logging
+      - DEBUG=${DEBUG:-false}
+      # Set to 0 to disable CUDA builds
+      - SAM2_BUILD_CUDA=${SAM2_BUILD_CUDA:-1}
+      # Enable OpenEXR support in OpenCV
+      - OPENCV_IO_ENABLE_OPENEXR=1
+    volumes:
+      - /media/ptgml/ptg/vasista/NUKE_PLUGIN_SAM2/Downloads/frames/output_dir:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    command: ["--host", "0.0.0.0", "--port", "8000"]
+
+# For local development without GPU
+  nuke-samurai-api-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nuke-samurai-api:latest
+    container_name: nuke-samurai-api-cpu
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - CUDA_VISIBLE_DEVICES=""
+      - DEBUG=${DEBUG:-false}
+      - SAM2_BUILD_CUDA=0
+      - OPENCV_IO_ENABLE_OPENEXR=1
+    profiles: ["cpu"]
+    command: ["--host", "0.0.0.0", "--port", "8000"] 
